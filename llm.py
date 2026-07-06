@@ -139,12 +139,15 @@ class ClaudeProvider(LLMProvider):
         return f"Claude({tier})"
 
 
-class OllamaProvider(LLMProvider):
-    """Ollama at claw-core — no caching, no retry needed (local)."""
+DEFAULT_OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
-    def __init__(self, model: str = "hermes3:70b", endpoint: str = "http://100.126.22.55:11434"):
+
+class OllamaProvider(LLMProvider):
+    """Ollama — no caching, no retry needed (local)."""
+
+    def __init__(self, model: str = "hermes3:70b", endpoint: str = ""):
         self.model = model
-        self.endpoint = endpoint.rstrip("/")
+        self.endpoint = (endpoint or DEFAULT_OLLAMA_HOST).rstrip("/")
 
     def generate(self, system: str, user: str, timeout: int = 120) -> str:
         payload = {
@@ -179,6 +182,5 @@ def get_provider(provider: str = "claude", model: str = "", api_key: str = "",
             auto_tier=auto_tier and not model,  # honor explicit model choice
         )
     if provider == "ollama":
-        ep = endpoint or "http://100.126.22.55:11434"
-        return OllamaProvider(model=model or "hermes3:70b", endpoint=ep)
+        return OllamaProvider(model=model or "hermes3:70b", endpoint=endpoint or DEFAULT_OLLAMA_HOST)
     raise ValueError(f"Unknown provider: {provider}")

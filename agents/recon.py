@@ -69,6 +69,27 @@ class ReconAgent(BaseAgent):
         # ── 3. Parse ports into session ───────────────────────────
         self._parse_nmap_into_session(deep.output)
 
+        # ── 3b. NSE vulnerability scripts (free wins) ─────────────
+        cr = self.checkpoint(
+            what_found=f"{len(open_ports)} services identified",
+            plan=f"nmap --script=vuln,default -p{ports_str}",
+            why="NSE vuln scripts detect EternalBlue (ms17-010), Shellshock, Heartbleed, ms08-067, smb-vuln-* — free CVE hits without extra tooling.",
+            what_to_look_for="VULNERABLE: entries in output, especially SMB/HTTP/SSL vulns",
+            command=f"nmap --script vuln -p{ports_str} {ip}",
+            risk="low",
+        )
+        if cr.approved:
+            self.log("Running NSE vuln scripts (may take 2-3 min)...")
+            vuln_cmd = cr.override if cr.action == cp.CheckpointResult.MODIFIED else f"nmap --script vuln -p{ports_str} {ip}"
+            vuln = run(vuln_cmd, timeout=400, log_dir=self.output_dir,
+                       on_output=lambda l: cp.tool_output("nmap-vuln", l) if "VULNERABLE" in l else None)
+            result.raw_outputs["nmap_vuln"] = vuln.output
+
+            # Surface any VULNERABLE hits
+            vuln_hits = re.findall(r"(\S+):\s*\n\s+VULNERABLE", vuln.output)
+            if vuln_hits:
+                self.log(f"NSE flagged vulnerable: {', '.join(set(vuln_hits))}", "success")
+
         # ── 4. Web fingerprinting — all ports in parallel ─────────
         if self.session.web_ports:
             self.log(f"Web fingerprinting {len(self.session.web_ports)} port(s) in parallel...")
@@ -98,11 +119,15 @@ class ReconAgent(BaseAgent):
 
         # ── 5. LLM analysis ──────────────────────────────────────
         self.log("LLM analysing recon output...")
+        vuln_out = result.raw_outputs.get("nmap_vuln", "")
         analysis = self.ask_json(f"""
 Analyse this nmap output for an HTB machine at {ip}.
 
 NMAP OUTPUT:
 {deep.output[:4000]}
+
+NSE VULN SCRIPTS:
+{vuln_out[:2000] if vuln_out else '(not run)'}
 
 Respond with JSON:
 {{

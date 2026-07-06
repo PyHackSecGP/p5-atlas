@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+*.log
+sessions/
+atlas-sessions/
+output/
+.DS_Store

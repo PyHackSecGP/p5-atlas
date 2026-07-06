@@ -335,7 +335,10 @@ Respond with JSON:
         return any(re.search(p, output, re.M) for p in indicators)
 
     def _extract_flag(self, output: str) -> str:
-        m = re.search(r'[0-9a-f]{32}', output, re.I)
+        m = re.search(r'HTB\{[^}]+\}', output)
+        if m:
+            return m.group(0)
+        m = re.search(r'\b[0-9a-f]{32}\b', output, re.I)
         return m.group(0) if m else ""
 
     # ── Display ───────────────────────────────────────────────────

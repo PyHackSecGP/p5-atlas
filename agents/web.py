@@ -9,19 +9,29 @@ from tools.runner import run, run_parallel
 from agents.base import BaseAgent
 import checkpoint as cp
 
-WORDLISTS = [
-    "/usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt",
+# common.txt first (4k words, fast) — medium only if explicitly needed
+WORDLISTS_FAST = [
     "/usr/share/seclists/Discovery/Web-Content/common.txt",
     "/usr/share/wordlists/dirb/common.txt",
     "/usr/share/dirb/wordlists/common.txt",
 ]
+WORDLISTS_DEEP = [
+    "/usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt",
+    "/usr/share/seclists/Discovery/Web-Content/raft-medium-words.txt",
+]
 
 NUCLEI_TEMPLATES = os.path.expanduser("~/nuclei-templates")
 NUCLEI_BIN = shutil.which("nuclei") or os.path.expanduser("~/bin/nuclei")
+FFUF_BIN   = shutil.which("ffuf") or ""
 
 
-def _find_wordlist() -> str:
-    for w in WORDLISTS:
+def _find_wordlist(deep: bool = False) -> str:
+    lists = WORDLISTS_DEEP if deep else WORDLISTS_FAST
+    for w in lists:
+        if os.path.exists(w):
+            return w
+    # fallback
+    for w in WORDLISTS_FAST + WORDLISTS_DEEP:
         if os.path.exists(w):
             return w
     return "/usr/share/wordlists/dirb/common.txt"
@@ -49,37 +59,65 @@ class WebAgent(BaseAgent):
             self.log(f"Attacking web target: {url}")
             cp.section(f"Web: {url}")
 
-            # ── Nikto + Gobuster — single checkpoint, parallel run ─
-            wordlist = _find_wordlist()
-            gobuster_cmd = f"gobuster dir -u {url} -w {wordlist} -t 50 -x php,txt,html,bak,zip --no-error -q"
-            nikto_cmd    = f"nikto -h {url} -timeout 10"
+            # ── ffuf (primary, fast) + curl headers probe — parallel ─
+            wordlist = _find_wordlist(deep=False)   # common.txt ~4k words
+            is_https = url.startswith("https")
+
+            # ffuf: fast, parallel, handles SSL natively
+            if FFUF_BIN:
+                dir_cmd = (
+                    f"{FFUF_BIN} -u {url}/FUZZ -w {wordlist} "
+                    f"-t 100 -mc 200,204,301,302,307,401,403,405 "
+                    f"-ac -s"   # -ac: auto-calibrate false positives, -s: silent
+                    + (" -k" if is_https else "")
+                )
+                scanner = "ffuf"
+            else:
+                # fallback to gobuster with SSL skip
+                dir_cmd = (
+                    f"gobuster dir -u {url} -w {wordlist} -t 50 "
+                    f"-x php,txt,html,bak,zip --no-error -q"
+                    + (" -k" if is_https else "")
+                )
+                scanner = "gobuster"
+
+            # curl for quick header/info grab (always fast)
+            curl_cmd = f"curl -sk -o /dev/null -D - {url} -L --max-time 10"
 
             cr = self.checkpoint(
                 what_found=f"{url} — Tech: {', '.join(wt.tech[:5]) or 'unknown'}",
-                plan=f"nikto + gobuster in parallel (wordlist: {wordlist.split('/')[-1]})",
-                why="Nikto finds server misconfigs; gobuster finds hidden paths. Running both simultaneously cuts stage time in half.",
-                what_to_look_for="nikto: old software, dangerous methods, admin panels. gobuster: /admin, /upload, /.git, /backup, /api",
-                command=f"[parallel] {nikto_cmd}  &&  {gobuster_cmd}",
+                plan=f"{scanner} dir brute (common.txt, fast) + curl headers",
+                why=f"{scanner} finds hidden paths; common.txt = 4k words, completes in <60s. Curl reveals auth headers, redirects, cookies.",
+                what_to_look_for="/admin, /api, /upload, /backup, /.git, /config, login pages, 401/403 (exists but blocked)",
+                command=dir_cmd,
                 risk="medium",
             )
             if cr.approved:
-                self.log("Running nikto + gobuster in parallel...")
+                self.log(f"Running {scanner} + curl headers in parallel...")
+                scan_cmd = cr.override if cr.action == cp.CheckpointResult.MODIFIED else dir_cmd
                 parallel_results = run_parallel([
-                    {"name": "nikto",    "command": nikto_cmd,    "timeout": 120, "log_dir": self.output_dir},
-                    {"name": "gobuster", "command": gobuster_cmd, "timeout": 300, "log_dir": self.output_dir},
+                    {"name": scanner, "command": scan_cmd, "timeout": 90,  "log_dir": self.output_dir},
+                    {"name": "curl",  "command": curl_cmd, "timeout": 15,  "log_dir": self.output_dir},
                 ], max_workers=2)
 
-                nikto_r    = parallel_results.get("nikto")
-                gobuster_r = parallel_results.get("gobuster")
+                scan_r = parallel_results.get(scanner)
+                curl_r = parallel_results.get("curl")
 
-                if nikto_r:
-                    result.raw_outputs[f"nikto_{url}"] = nikto_r.output
-                    all_findings.append(f"Nikto ({url}):\n{nikto_r.output[:1000]}")
+                if curl_r and curl_r.output:
+                    result.raw_outputs[f"curl_{url}"] = curl_r.output
+                    all_findings.append(f"HTTP headers ({url}):\n{curl_r.output[:500]}")
 
-                if gobuster_r:
-                    result.raw_outputs[f"gobuster_{url}"] = gobuster_r.output
-                    wt.directories = re.findall(r"(/\S+)\s+\(Status: (\d+)\)", gobuster_r.output)
-                    all_findings.append(f"Gobuster ({url}):\n{gobuster_r.output[:1500]}")
+                if scan_r and scan_r.output:
+                    result.raw_outputs[f"{scanner}_{url}"] = scan_r.output
+                    # parse ffuf output (Status: NNN) or gobuster (/path Status: NNN)
+                    if scanner == "ffuf":
+                        paths = re.findall(r"\S+\s+\[Status:\s*(\d+)", scan_r.output)
+                        wt.directories = [(m, s) for m, s in
+                                          re.findall(r"(\S+)\s+\[Status:\s*(\d+)", scan_r.output)]
+                    else:
+                        wt.directories = re.findall(r"(/\S+)\s+\(Status: (\d+)\)", scan_r.output)
+                    all_findings.append(f"{scanner.capitalize()} ({url}):\n{scan_r.output[:2000]}")
+                    self.log(f"{scanner}: {len(wt.directories)} path(s) found")
 
             # ── Nuclei vuln scan ──────────────────────────────────
             if _nuclei_available():

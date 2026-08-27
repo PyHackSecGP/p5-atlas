@@ -148,11 +148,16 @@ Respond with JSON:
             result.next_actions = analysis.get("attack_vectors", [])
             result.metadata = analysis
 
-            # ── Hydra brute-force if usernames + login-service found ─
+            # ── Hydra brute-force — LAST RESORT only ─────────────
+            # Only fires when: usernames found + login service open + no other attack vectors
             llm_users = [u.strip() for u in analysis.get("usernames", []) if u and u.strip()]
             all_users = list(dict.fromkeys(known_users + llm_users))
-            if all_users:
+            has_other_vectors = bool(analysis.get("attack_vectors")) or bool(self.session.web_targets)
+            if all_users and not has_other_vectors:
+                self.log("No other attack vectors — hydra brute as last resort", "warning")
                 self._try_hydra_bruteforce(ip, all_users, result)
+            elif all_users and has_other_vectors:
+                self.log(f"Skipping hydra — {len(analysis.get('attack_vectors', []))} other vector(s) available. Hydra = last resort.", "info")
 
             cp.section("Enumeration Analysis")
             from rich.console import Console

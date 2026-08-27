@@ -33,8 +33,40 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich import box
+import subprocess
 
 console = Console()
+
+
+def preflight(target: str) -> bool:
+    """Verify HTB VPN up and target alive."""
+    # VPN check — look for any tun interface
+    vpn = subprocess.run(["ip", "link", "show"], capture_output=True, text=True)
+    tun_found = "tun" in vpn.stdout
+    if not tun_found:
+        console.print("  [yellow]⚠  No tun interface found — is HTB VPN connected?[/yellow]")
+    else:
+        tuns = [l.split(":")[1].strip() for l in vpn.stdout.splitlines() if "tun" in l]
+        console.print(f"  [green]✓  VPN interface: {', '.join(tuns)}[/green]")
+
+    # Ping
+    ping = subprocess.run(
+        ["ping", "-c", "2", "-W", "2", target],
+        capture_output=True, text=True,
+    )
+    if ping.returncode != 0:
+        console.print(f"  [red]✗  Target {target} not responding to ping[/red]")
+        console.print("  [dim]Target may be down or block ICMP — continue anyway? (y/n)[/dim]")
+        if input("  > ").strip().lower() != "y":
+            return False
+    else:
+        # Extract round-trip time
+        rtt = ""
+        for line in ping.stdout.splitlines():
+            if "avg" in line:
+                rtt = line.split("/")[4] + "ms" if "/" in line else ""
+        console.print(f"  [green]✓  Target {target} alive{' RTT: ' + rtt if rtt else ''}[/green]")
+    return True
 
 
 BANNER = r"""
@@ -131,6 +163,7 @@ def print_session_list() -> None:
     t.add_column("Stage")
     t.add_column("Ports", justify="right")
     t.add_column("Creds", justify="right")
+    t.add_column("Loot", justify="right")
     t.add_column("User", justify="center")
     t.add_column("Root", justify="center")
 
@@ -140,7 +173,7 @@ def print_session_list() -> None:
         t.add_row(
             s["target_ip"], s["machine_name"], s["os_guess"],
             s["stage"], str(s["ports"]), str(s["creds"]),
-            user_mark, root_mark,
+            str(s.get("loot", 0)), user_mark, root_mark,
         )
     console.print(t)
 
@@ -244,6 +277,11 @@ Examples:
         title="[bold cyan]ATLAS — Operation Start[/bold cyan]",
         border_style="cyan",
     ))
+
+    # ── Pre-flight ────────────────────────────────────────────────
+    console.print("\n[bold dim]Pre-flight checks...[/bold dim]")
+    if not preflight(args.target):
+        sys.exit(1)
 
     if not cp.AUTO_MODE:
         input("\n  Press Enter to begin...\n")

@@ -90,6 +90,8 @@ class HackSession:
     root_flag: str = ""
     notes: list[str] = field(default_factory=list)
 
+    loot: list[str] = field(default_factory=list)   # paths to downloaded loot files
+
     @property
     def open_ports(self) -> list[Port]:
         return [p for p in self.ports if p.state == "open"]
@@ -102,6 +104,24 @@ class HackSession:
     def ssh_port(self) -> Port | None:
         for p in self.open_ports:
             if p.service == "ssh" or p.number == 22:
+                return p
+        return None
+
+    @property
+    def winrm_port(self) -> Port | None:
+        for p in self.open_ports:
+            if p.number in (5985, 5986) or "winrm" in p.service.lower() or "wsman" in p.service.lower():
+                return p
+        return None
+
+    @property
+    def smb_ports(self) -> list[Port]:
+        return [p for p in self.open_ports if p.number in (139, 445) or p.service in ("microsoft-ds", "netbios-ssn", "smb")]
+
+    @property
+    def rdp_port(self) -> Port | None:
+        for p in self.open_ports:
+            if p.number == 3389 or "rdp" in p.service.lower() or "ms-wbt" in p.service.lower():
                 return p
         return None
 

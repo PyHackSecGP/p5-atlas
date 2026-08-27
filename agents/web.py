@@ -1,6 +1,8 @@
-"""Web Agent — directory brute-force, nikto, vuln detection, LFI/SQLi probing."""
+"""Web Agent — directory brute, nuclei vuln scan, nikto, vhost enum, LFI/SQLi probing."""
 from __future__ import annotations
+import os
 import re
+import shutil
 from models import HackSession, AgentResult, Stage, Finding, Severity
 from llm import LLMProvider
 from tools.runner import run, run_parallel
@@ -14,13 +16,19 @@ WORDLISTS = [
     "/usr/share/dirb/wordlists/common.txt",
 ]
 
+NUCLEI_TEMPLATES = os.path.expanduser("~/nuclei-templates")
+NUCLEI_BIN = shutil.which("nuclei") or os.path.expanduser("~/bin/nuclei")
+
 
 def _find_wordlist() -> str:
-    import os
     for w in WORDLISTS:
         if os.path.exists(w):
             return w
     return "/usr/share/wordlists/dirb/common.txt"
+
+
+def _nuclei_available() -> bool:
+    return bool(NUCLEI_BIN and os.path.exists(NUCLEI_BIN))
 
 
 class WebAgent(BaseAgent):
@@ -73,6 +81,33 @@ class WebAgent(BaseAgent):
                     wt.directories = re.findall(r"(/\S+)\s+\(Status: (\d+)\)", gobuster_r.output)
                     all_findings.append(f"Gobuster ({url}):\n{gobuster_r.output[:1500]}")
 
+            # ── Nuclei vuln scan ──────────────────────────────────
+            if _nuclei_available():
+                cr = self.checkpoint(
+                    what_found=f"{url} — {len(wt.directories)} paths found",
+                    plan=f"nuclei -u {url} (critical/high/medium templates)",
+                    why="Nuclei has 4000+ templates covering CVEs, misconfigs, default creds, exposed panels, API issues. Fastest way to find known vulns on web services.",
+                    what_to_look_for="[critical] [high] severity hits — CVEs, exposed admin panels, default creds, path traversal, SSRF",
+                    command=f"{NUCLEI_BIN} -u {url} -t {NUCLEI_TEMPLATES} -severity critical,high,medium -silent",
+                    risk="medium",
+                )
+                if cr.approved:
+                    nuclei_cmd = cr.override if cr.action == cp.CheckpointResult.MODIFIED else (
+                        f"{NUCLEI_BIN} -u {url} -t {NUCLEI_TEMPLATES} "
+                        f"-severity critical,high,medium -silent -timeout 10 -rl 50"
+                    )
+                    self.log("Running nuclei (this may take 2-3 min)...")
+                    nuclei_r = run(nuclei_cmd, timeout=300, log_dir=self.output_dir,
+                                  on_output=lambda l: cp.tool_output("nuclei", l) if l.strip() else None)
+                    if nuclei_r.output.strip():
+                        result.raw_outputs[f"nuclei_{url}"] = nuclei_r.output
+                        all_findings.append(f"Nuclei ({url}):\n{nuclei_r.output[:3000]}")
+                        hit_count = nuclei_r.output.count("[critical]") + nuclei_r.output.count("[high]")
+                        if hit_count:
+                            self.log(f"NUCLEI: {hit_count} critical/high hit(s) — check output!", "success")
+                    else:
+                        self.log("Nuclei: no findings at medium+ severity")
+
             # ── ffuf vhost enumeration if applicable ──────────────
             # (only run if we suspect vhost routing, i.e. non-IP hostname)
             domain_m = re.search(r'\.htb|\.local', " ".join(wt.tech), re.I)
@@ -98,9 +133,11 @@ class WebAgent(BaseAgent):
         if all_findings:
             self.log("LLM analysing web findings...")
             combined = "\n\n---\n\n".join(all_findings)
+            nuclei_hits = [f for f in all_findings if f.startswith("Nuclei")]
             analysis = self.ask_json(f"""
 You are analysing web recon output for an HTB machine.
 Tech stack detected: {[wt.tech for wt in self.session.web_targets]}
+Nuclei found {len(nuclei_hits)} result set(s).
 
 WEB FINDINGS:
 {combined[:6000]}

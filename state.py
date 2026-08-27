@@ -67,6 +67,7 @@ def load(path: str) -> HackSession | None:
         user_flag=data.get("user_flag", ""),
         root_flag=data.get("root_flag", ""),
         notes=data.get("notes", []),
+        loot=data.get("loot", []),
     )
 
 
@@ -92,6 +93,7 @@ def list_sessions(base_dir: str = "") -> list[dict]:
                 "root_flag":    data.get("root_flag", ""),
                 "ports":        len(data.get("ports", [])),
                 "creds":        len(data.get("credentials", [])),
+                "loot":         len(data.get("loot", [])),
                 "path":         str(session_dir),
             })
         except (json.JSONDecodeError, KeyError):

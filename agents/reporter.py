@@ -95,23 +95,54 @@ For each step explain WHY you did it, WHAT you expected, and WHAT you found.""",
 
         console.print(Panel(t, title="[green]Session Summary[/green]", border_style="green"))
 
-        # ── Commit to ctf-lab if available ────────────────────────
+        # ── Commit + push to ctf-lab if available ─────────────────
         if ctf_path.exists():
             cr = self.checkpoint(
                 what_found=f"Writeup written to {writeup_path}",
-                plan=f"git add + commit to ctf-lab: '{machine} — HTB writeup'",
-                why="Commit discipline: every rooted/attempted machine gets documented. Builds portfolio and searchable knowledge base.",
-                what_to_look_for="Clean commit, no sensitive data in writeup",
-                command=f"git -C {ctf_path} add . && git -C {ctf_path} commit -m 'htb: {machine} writeup {date_str}'",
+                plan=f"git commit + push to GitHub + Forgejo: '{machine} writeup {date_str}'",
+                why="Commit discipline: every rooted/attempted machine gets documented. Push to both remotes so GitHub portfolio and Forgejo self-hosted stay in sync.",
+                what_to_look_for="Clean commit, no internal IPs or API keys in writeup",
+                command=f"git -C {ctf_path} add . && git -C {ctf_path} commit + push",
                 risk="low",
             )
             if cr.approved:
                 subprocess.run(["git", "-C", str(ctf_path), "add", "."], check=False)
-                subprocess.run(
+                commit_result = subprocess.run(
                     ["git", "-C", str(ctf_path), "commit", "-m", f"htb: {machine} writeup {date_str}"],
-                    check=False,
+                    capture_output=True, text=True,
                 )
-                self.log("Committed to ctf-lab", "success")
+                if commit_result.returncode == 0:
+                    self.log("Committed to ctf-lab", "success")
+                    self._push_to_remotes(ctf_path)
+                elif "nothing to commit" in (commit_result.stdout + commit_result.stderr):
+                    self.log("Nothing new to commit", "info")
+                    self._push_to_remotes(ctf_path)
+                else:
+                    self.log(f"Commit failed: {commit_result.stderr[:200]}", "error")
 
         result.summary = f"Writeup generated at {writeup_path}"
         return result
+
+    def _push_to_remotes(self, repo_path) -> None:
+        """Push to all configured remotes."""
+        # Get list of remotes
+        remotes_result = subprocess.run(
+            ["git", "-C", str(repo_path), "remote"],
+            capture_output=True, text=True,
+        )
+        remotes = [r.strip() for r in remotes_result.stdout.splitlines() if r.strip()]
+        if not remotes:
+            self.log("No remotes configured", "warning")
+            return
+
+        for remote in remotes:
+            self.log(f"Pushing to {remote}...")
+            push = subprocess.run(
+                ["git", "-C", str(repo_path), "push", remote, "--all"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if push.returncode == 0:
+                self.log(f"Pushed to {remote}", "success")
+            else:
+                err = (push.stderr or push.stdout)[:150]
+                self.log(f"Push to {remote} failed: {err}", "warning")

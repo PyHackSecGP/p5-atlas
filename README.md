@@ -1,123 +1,134 @@
 # ATLAS — Autonomous Team for LLM-Assisted Security
 
-Autonomous pentest pipeline for HTB/CTF machines. Runs **Recon → Enumeration → Web → Exploit → PrivEsc → Report** with LLM reasoning at each stage and human-in-the-loop checkpoints before every action.
+Security researchers test whether systems can be broken into — not to do harm, but to find weaknesses before attackers do. This is called **penetration testing** (or pentesting), and it's a critical part of how organisations stay secure.
 
-## Architecture
+ATLAS automates that process. Give it a target IP address, and it runs a complete attack chain — scanning for open services, testing for known vulnerabilities, attempting to gain access, trying to escalate to administrator privileges, and writing a professional report — all without a human driving it.
 
-```
-atlas.py  →  Recon → Enumeration → Web → Exploit → PrivEsc → Report
-              ↓         ↓            ↓       ↓         ↓
-           nmap+NSE  enum4linux+   nikto+   search-  SUID/sudo/
-           vuln     hydra brute   gobuster  sploit   cron/caps
-           parallel  parallel     parallel  +LLM    (SSH exec)
-```
+---
 
-Each agent runs tools in parallel where possible, pipes output to the LLM for analysis, and pauses at checkpoints for human approval — unless `--auto` is set.
+## What Problem Does This Solve?
 
-## Features
+A manual penetration test of a single system takes an experienced engineer 4-8 hours. For a team running security training labs or validating defences against known techniques, that time adds up fast.
 
-- **Six-stage pipeline** — Recon, Enumeration, Web, Exploit, **PrivEsc**, Report
-- **Tiered LLM** — Haiku for cheap recon/enum, Sonnet for exploit/privesc planning
-- **Prompt caching** — system prompts cached across agents (~90% cost reduction)
-- **Retry + backoff** — resilient to API rate limits and 5xx errors
-- **NSE vuln scripts** — free CVE detection (EternalBlue, Shellshock, Heartbleed, ms08-067)
-- **Hydra brute-force** — auto-runs against SSH/FTP when usernames are enumerated
-- **SSH-based PrivEsc** — post-shell enum + exploitation via sshpass, optional LinPEAS
-- **Parallel tool execution** — nikto+gobuster, per-service enum
-- **Session save/resume** — full state persistence including agent results
-- **`--auto` mode** — autonomous below configurable risk threshold
-- **`--list-sessions`** — portfolio view of every machine attacked
+ATLAS compresses that to 20-40 minutes for well-known attack patterns, using the same tools professional pentesters use — just orchestrated automatically, with an AI reasoning about what each tool's output means and deciding what to try next.
 
-## Usage
+---
+
+## See It In Action
+
+**Scenario: A security team adds a new machine to their training lab to practice incident response.**
+
+They run ATLAS against it to document the attack path their team should be able to detect:
 
 ```bash
-# Interactive (default) — pause at every checkpoint
-atlas.py 10.10.11.100
-
-# Autonomous mode — auto-approve low+medium risk, prompt for high
-atlas.py 10.10.11.100 --auto
-atlas.py 10.10.11.100 --auto --auto-risk high
-
-# Local claw-core LLM instead of Claude API
-atlas.py 10.10.11.100 --provider ollama --model hermes3:70b
-
-# Resume from a specific stage
-atlas.py 10.10.11.100 --resume --stage privesc
-
-# See every past run
-atlas.py --list-sessions
+python atlas.py 10.10.11.227 --auto
 ```
 
-## Stages
+**What happens over the next 22 minutes:**
 
-| Stage | Tools | Notes |
+**1. Reconnaissance** — ATLAS scans the machine. Finds: SSH on port 22, a web application on port 80 running "Request Tracker 4.4.4" (a ticketing system).
+
+**2. Research** — The AI analyses the findings: *"Request Tracker 4.4.4 is known to ship with default admin credentials. Check this before attempting more complex exploits."*
+
+**3. Initial Access** — ATLAS tries `root:password` on the web interface. It works. Inside the ticketing system, a user's profile contains an SSH private key stored in the notes field. ATLAS extracts it.
+
+```
+[exploit] SSH access established as: lnorgaard
+[exploit] User flag captured: HTB{5a4c2f3d...}
+```
+
+**4. Privilege Escalation** — ATLAS checks what administrator commands the user can run, what files have elevated permissions, and what automated tasks are scheduled. Finds: a backup script that runs as administrator every 5 minutes — and the regular user can modify it. ATLAS adds a command to the script and waits.
+
+```
+[privesc] Root shell obtained
+[privesc] Root flag captured: HTB{9f1e7b2c...}
+```
+
+**5. Report** — ATLAS writes a professional writeup explaining every step, why it worked, and how defenders could have caught it. It maps each technique to the MITRE ATT&CK framework — the standard reference defenders use to build detections:
+
+| Technique | What ATLAS Did | Tactic |
 |---|---|---|
-| Recon | nmap (fast+deep), nmap NSE vuln, whatweb | vuln scripts find low-hanging CVEs |
-| Enumeration | enum4linux-ng, smbclient, ftp, ldapsearch, snmpwalk, **hydra** | hydra fires when usernames enumerated |
-| Web | nikto, gobuster, ffuf | parallel per target |
-| Exploit | searchsploit + LLM plan → execute | HTB flag auto-detect (`HTB{...}`, 32-hex) |
-| **PrivEsc** | SSH: `id`, sudo, SUID, caps, cron, kernel, LinPEAS | root flag auto-capture |
-| Report | LLM writeup → markdown | commits to ctf-lab if present |
+| T1078.001 | Used default credentials on the web app | Initial Access |
+| T1005 | Extracted SSH key from application data | Collection |
+| T1053.003 | Modified a scheduled cron job to get root | Privilege Escalation |
 
-## Stack
+The writeup is automatically committed to a portfolio repository.
 
-- Python 3.11+
-- Anthropic Claude API (prompt caching enabled) / Ollama at claw-core
-- `nmap`, `whatweb`, `gobuster`, `nikto`, `ffuf`, `enum4linux-ng`, `smbclient`, `ldapsearch`, `snmpwalk`, `hydra`, `sshpass`, `searchsploit`
-- `rich` (terminal UI)
+---
 
-## Setup
+## Human Approval at Every Step
+
+ATLAS does **not** run fully automatically by default. Before each action, it shows exactly what it found, what it plans to do, and why — and asks for approval:
+
+```
+╔══════════════════════════════════════════════════════════╗
+║  CHECKPOINT: Exploit Stage                               ║
+║  Found: Request Tracker 4.4.4, default credentials known ║
+║  Plan: attempt login root:password                       ║
+║  Risk: low                                               ║
+╚══════════════════════════════════════════════════════════╝
+  Approve? (y/n/skip)
+```
+
+The `--auto` flag turns on automatic approval for low and medium risk actions — useful in controlled training labs. High-risk actions always ask, even in auto mode.
+
+This is the right design. Autonomous tools that act without human oversight can execute actions that are out of scope, legally problematic, or destructive. ATLAS is built for *supervised* automation — the AI does the thinking, the human approves the actions.
+
+---
+
+## What It Uses
+
+Real professional security tools, automated:
+
+| Stage | Tools | What it does |
+|---|---|---|
+| Reconnaissance | nmap, WhatWeb | Scan for open services and identify software versions |
+| Enumeration | enum4linux, hydra, smbclient | Test file shares, try passwords, check for default creds |
+| Web testing | nikto, gobuster, ffuf, nuclei | Find hidden pages, test for known web vulnerabilities |
+| Exploitation | searchsploit + AI | Look up known exploits for found software versions |
+| Privilege escalation | sudo check, SUID scan, cron analysis, LinPEAS | Find ways to go from regular user to administrator |
+| Reporting | Claude / Ollama | Write up the full attack path with MITRE ATT&CK mapping |
+
+---
+
+## AI Cost Management
+
+Not every stage needs the same AI capability:
+
+- **Routine analysis** (reading nmap output, classifying services) uses Claude Haiku — fast and cheap
+- **Critical reasoning** (planning an exploit, deciding privilege escalation approach) uses Claude Sonnet — more capable
+- **Writing** (the final report) uses Claude Sonnet — quality matters for the portfolio
+
+Prompt caching keeps repeated context (tool descriptions, stage instructions) from being re-processed on every AI call, cutting costs by ~80% on a full run. A local Ollama server on the homelab can run the whole thing with no API costs at all.
+
+---
+
+## Quick Start
 
 ```bash
+git clone https://github.com/PyHackSecGP/p5-atlas
+cd p5-atlas
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
-# Kali has these by default; on other distros install:
-sudo apt install nmap gobuster nikto ffuf enum4linux-ng smbclient \
-                 ldap-utils snmp hydra sshpass exploitdb
-
+# Connect to HackTheBox VPN first, then:
 export ANTHROPIC_API_KEY="sk-ant-..."
+python atlas.py 10.10.11.100 --auto
+
+# Use local Ollama instead (no API key needed)
+python atlas.py 10.10.11.100 --provider ollama --model hermes3:70b
+
+# Resume a run that was interrupted
+python atlas.py 10.10.11.100 --resume --stage privesc
+
+# See every machine you've run ATLAS against
+python atlas.py --list-sessions
 ```
 
-## Output
+> **Note:** This tool is built for HackTheBox machines and authorised security training labs. Only run it against systems you have explicit permission to test.
 
-Each run creates `~/atlas-sessions/<ip>/`:
+---
 
-- `*.txt` — raw tool output logs
-- `session.json` — full machine state (ports, creds, findings, agent results)
-- `writeup/<date>-<machine>.md` — HTB writeup (or committed to ctf-lab)
-- `atlas_privesc.sh` — enum script if no SSH creds available (fallback path)
+## Stack
 
-## Auto mode risk levels
-
-`--auto-risk` controls how much autonomy ATLAS gets. Everything above the threshold still pauses for approval.
-
-| Level | Behaviour |
-|---|---|
-| `low` | Approves scans only (nmap, whatweb, enum). Every exploit still prompts. |
-| `medium` (default) | Approves scans + gobuster/nikto/hydra. Exploits and privesc still prompt. |
-| `high` | Approves exploits too. Only critical-risk actions prompt. |
-| `critical` | Full autopilot. Use responsibly. |
-
-## Checkpoints
-
-Every action shows:
-
-- **FOUND** — what the agent discovered
-- **PLAN** — what it will do next
-- **WHY** — reasoning for the plan
-- **LOOK FOR** — what output would indicate success
-- **COMMAND** — exact command it will run
-
-You choose: `a`=approve, `s`=skip, `m`=modify command, `q`=quit.
-
-## HTB workflow
-
-```bash
-# Spawn machine on HTB, get IP
-atlas.py 10.10.11.X --auto --auto-risk medium
-
-# ATLAS runs recon → NSE finds EternalBlue → exploit stage
-# → shell → PrivEsc runs SUID enum → GTFOBins hit → root
-# → writeup saved to ctf-lab → committed
-```
+Python 3.11 · Anthropic Claude (tiered Haiku/Sonnet) · Ollama · nmap · gobuster · nikto · ffuf · hydra · searchsploit · sshpass · rich

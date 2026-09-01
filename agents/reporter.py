@@ -6,6 +6,7 @@ from pathlib import Path
 from models import HackSession, AgentResult, Stage
 from llm import LLMProvider
 from agents.base import BaseAgent
+from tools.mitre_mapper import map_findings_to_attack, format_attack_table_markdown
 import checkpoint as cp
 
 
@@ -67,8 +68,20 @@ For each step explain WHY you did it, WHAT you expected, and WHAT you found.""",
 
         writeup_dir.mkdir(parents=True, exist_ok=True)
         writeup_path = writeup_dir / f"{date_str}-{machine}.md"
+
+        # Append MITRE ATT&CK table
+        techniques = map_findings_to_attack(
+            session.findings, session.agent_results, session.notes
+        )
+        attack_section = format_attack_table_markdown(techniques)
+        if attack_section:
+            writeup_text = writeup_text.rstrip() + "\n\n" + attack_section + "\n"
+
         writeup_path.write_text(writeup_text)
         self.log(f"Writeup saved: {writeup_path}", "success")
+
+        if techniques:
+            self.log(f"MITRE ATT&CK: {len(techniques)} techniques mapped", "info")
 
         # ── Print final summary ───────────────────────────────────
         from rich.console import Console
@@ -92,8 +105,22 @@ For each step explain WHY you did it, WHAT you expected, and WHAT you found.""",
         t.add_row("User flag",   f"[green]{session.user_flag}[/green]" if session.user_flag else "[red]Not captured[/red]")
         t.add_row("Root flag",   f"[green]{session.root_flag}[/green]" if session.root_flag else "[red]Not captured[/red]")
         t.add_row("Writeup",     str(writeup_path))
+        if techniques:
+            tactic_names = list(dict.fromkeys(tech.tactic for tech in techniques))
+            t.add_row("ATT&CK",      f"{len(techniques)} techniques — {', '.join(tactic_names[:4])}")
 
         console.print(Panel(t, title="[green]Session Summary[/green]", border_style="green"))
+
+        # Print ATT&CK table inline
+        if techniques:
+            from rich.table import Table as RichTable
+            atk = RichTable(title="MITRE ATT&CK", box=box.MINIMAL_DOUBLE_HEAD, show_lines=False)
+            atk.add_column("ID", style="cyan", width=14)
+            atk.add_column("Technique", style="white")
+            atk.add_column("Tactic", style="yellow")
+            for tech in techniques:
+                atk.add_row(tech.id, tech.name, tech.tactic)
+            console.print(atk)
 
         # ── Commit + push to ctf-lab if available ─────────────────
         if ctf_path.exists():

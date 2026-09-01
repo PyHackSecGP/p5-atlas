@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+from urllib.parse import urlparse
 from models import HackSession, AgentResult, Stage, Finding, Severity
 from llm import LLMProvider
 from tools.runner import run, run_parallel
@@ -147,25 +148,42 @@ class WebAgent(BaseAgent):
                         self.log("Nuclei: no findings at medium+ severity")
 
             # ── ffuf vhost enumeration if applicable ──────────────
-            # (only run if we suspect vhost routing, i.e. non-IP hostname)
-            domain_m = re.search(r'\.htb|\.local', " ".join(wt.tech), re.I)
-            if domain_m:
-                domain = domain_m.group(0).lstrip(".")
+            # Extract full hostname from URL (e.g. fireflow.htb, not just htb)
+            parsed_host = urlparse(url).hostname or ""
+            host_m = re.search(r'[a-z0-9-]+\.(htb|local|thm)', parsed_host, re.I)
+            if host_m:
+                full_domain = host_m.group(0)   # e.g. fireflow.htb
+                # Probe baseline with random subdomain to get filter size
+                baseline_cmd = f"curl -sk -o /dev/null -w '%{{size_download}}' {url} -H 'Host: randomxyz12345.{full_domain}' --max-time 5"
+                baseline_r = run(baseline_cmd, timeout=10)
+                try:
+                    baseline_sz = int(baseline_r.output.strip().strip("'"))
+                except (ValueError, AttributeError):
+                    baseline_sz = 0
+                fs_flag = f"-fs {baseline_sz}" if baseline_sz > 0 else "-fs 0"
+                vhost_cmd = (
+                    f"ffuf -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt "
+                    f"-u {url} -H 'Host: FUZZ.{full_domain}' {fs_flag} "
+                    f"-mc 200,301,302,403 -t 50 -s"
+                    + (" -k" if is_https else "")
+                )
                 cr = self.checkpoint(
-                    what_found=f"Domain pattern detected: *.{domain}",
-                    plan=f"ffuf vhost bruteforce on {domain}",
+                    what_found=f"Domain: {full_domain} (baseline size={baseline_sz})",
+                    plan=f"ffuf vhost bruteforce on {full_domain}",
                     why="HTB machines often use virtual hosting. Subdomains like dev.htb, admin.htb, api.htb expose additional attack surface not visible on the main IP.",
                     what_to_look_for="Non-404 responses with different size than baseline, especially admin/dev/api/internal subdomains",
-                    command=f"ffuf -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt -u {url} -H 'Host: FUZZ.{domain}' -fs 0",
+                    command=vhost_cmd,
                     risk="medium",
                 )
                 if cr.approved:
-                    cmd = cr.override if cr.action == cp.CheckpointResult.MODIFIED else f"ffuf -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt -u {url} -H 'Host: FUZZ.{domain}' -fs 0 -mc 200,301,302,403"
-                    self.log("Running vhost bruteforce...")
+                    cmd = cr.override if cr.action == cp.CheckpointResult.MODIFIED else vhost_cmd
+                    self.log(f"Running vhost bruteforce (filter size={baseline_sz})...")
                     ffuf = run(cmd, timeout=180, log_dir=self.output_dir,
                                on_output=lambda l: cp.tool_output("ffuf", l))
                     result.raw_outputs[f"ffuf_vhost"] = ffuf.output
-                    all_findings.append(f"vhost ffuf:\n{ffuf.output[:500]}")
+                    vhost_hits = [l for l in ffuf.output.splitlines() if l.strip() and "[Status:" in l]
+                    self.log(f"vhost: {len(vhost_hits)} unique vhost(s) found")
+                    all_findings.append(f"vhost ffuf ({full_domain}):\n{ffuf.output[:1000]}")
 
         # ── LLM analysis ─────────────────────────────────────────
         if all_findings:

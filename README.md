@@ -1,186 +1,199 @@
-# ATLAS — Autonomous Team for LLM-Assisted Security
-
-**Role:** Offensive Security / Security Engineer portfolio project  
-**Stack:** Python 3.11 · nmap · gobuster · nikto · hydra · searchsploit · sshpass · Anthropic Claude (tiered) · Ollama
+# ATLAS — Autonomous Pentest Pipeline: Interview Prep Notes
 
 ---
 
-## Why I Built This Instead of Using an Existing Tool
+## 30-Second Pitch (memorise this)
 
-**Pentera**, **NodeZero**, and **Horizon3.ai** are commercial autonomous pentest platforms. They cost $100k+/year and are used by large enterprise security teams. I didn't build this to compete with them — I built it to understand the full offensive chain that underlies them, so that when I'm working alongside one of those platforms, or scoping an engagement that uses them, I understand what they're actually doing at each stage.
-
-Specifically, I needed hands-on understanding of:
-
-- What nmap NSE vuln scripts actually detect and what their false-positive rate looks like in practice
-- How hydra brute-force is structured — when to run it, against which services, with what word lists — and why running it wrong wastes the engagement
-- How searchsploit maps service versions to exploit candidates, and what the LLM is actually adding when it filters those candidates
-- How SSH-based post-exploitation enumeration works — id, sudo, SUID, capabilities, cron — and what the attack path looks like from a defender's perspective
-- Where LLMs genuinely improve analyst throughput in offensive work, and where they create noise
-
-Every stage of ATLAS was built to answer one of those questions. I now think about offensive tooling differently — not as a black box that produces findings, but as a pipeline where each stage has specific failure modes, blind spots, and tradeoffs. That's directly useful when evaluating commercial tools, scoping engagements, or building detections for the techniques those tools use.
+"I built an autonomous penetration testing pipeline for HackTheBox machines. It runs a six-stage attack chain — recon with nmap and NSE vuln scripts, enumeration with enum4linux and hydra, web testing with nikto and gobuster, exploit planning via searchsploit and LLM, SSH-based privilege escalation, and auto-generated writeups with MITRE ATT&CK mapping. It uses tiered LLMs — Haiku for cheap recon analysis, Sonnet for exploit and privesc reasoning — with prompt caching to cut API costs ~80%. Human checkpoints before every action unless you enable auto mode."
 
 ---
 
-## What It Does
+## Q: Why did you build this instead of using Metasploit / Pentera / NodeZero?
 
-Give it a target IP. It runs a full six-stage attack chain with real security tools, LLM reasoning at each stage, and human-in-the-loop checkpoints before any action is executed.
+I didn't build it to replace those tools. I built it to understand the full offensive chain at the code level — what each stage is actually doing, where the failure modes are, and what the LLM is genuinely adding vs. just producing noise.
 
-```
-atlas.py <IP>
-    │
-    ├─ Recon         nmap fast scan + deep scan + NSE vuln scripts + WhatWeb
-    ├─ Enumeration   enum4linux-ng · smbclient · ftp anon · ldapsearch · snmpwalk · hydra · netexec
-    ├─ Web           nikto + gobuster + ffuf (parallel) · nuclei templates
-    ├─ Exploit       searchsploit lookup → LLM plan → execute → flag detection
-    ├─ PrivEsc       SSH post-shell: sudo · SUID · capabilities · cron · kernel · LinPEAS
-    └─ Report        LLM writeup → MITRE ATT&CK table → git commit → push to GitHub + Forgejo
-```
+Specifically I needed to understand:
+- What nmap NSE vuln scripts detect vs. what they miss — and their false positive rate
+- How hydra brute-force should be structured — when to run it, which services, what word lists
+- How searchsploit maps service versions to exploits — and why LLM filtering of those results is actually useful
+- What SSH post-exploitation enumeration looks like from a defender's perspective — what artifacts it leaves
+- Where in the pipeline LLMs help vs. where they hallucinate and break things
 
-It captures user and root flags, auto-generates a writeup, maps every technique used to MITRE ATT&CK, and commits the writeup to a portfolio repository.
+Now when I look at output from Pentera or Metasploit, I understand what each stage did and why.
 
 ---
 
-## Concrete Scenario: HTB Machine "Keeper"
+## Q: Walk me through the pipeline stages.
 
-A new HackTheBox machine goes live. Running ATLAS in auto mode:
+**1. Recon**
+- nmap fast scan (top 1000 ports) + full scan (all 65535)
+- nmap NSE vuln scripts: detect EternalBlue (ms17-010), Shellshock, Heartbleed, ms08-067
+- WhatWeb for web tech fingerprinting
+- LLM analyses all output → identifies high-value targets
 
-```bash
-atlas.py 10.10.11.227 --auto
+**2. Enumeration**
+- SMB: enum4linux-ng + smbclient share enumeration
+- FTP: anonymous login attempt
+- LDAP: ldapsearch for AD environments
+- SNMP: snmpwalk community string enumeration
+- Hydra: brute-force SSH/FTP when usernames discovered
+- netexec: credential spraying, SMB signing check
+
+**3. Web**
+- nikto: web vuln scanner (outdated software, misconfigs, default files)
+- gobuster: directory brute-force
+- ffuf: parameter fuzzing, vhost enumeration
+- nuclei: template-based vuln detection
+- All run in parallel per target
+
+**4. Exploit**
+- searchsploit: look up exploits by service/version string
+- LLM: filter candidates, generate execution plan
+- Execute plan → detect HTB flag pattern (`HTB{...}`, 32-char hex)
+
+**5. PrivEsc**
+- SSH into box with found credentials
+- Enumerate: `id`, `sudo -l`, SUID binaries, Linux capabilities, cron jobs, writable scripts
+- Optional LinPEAS upload and parse
+- LLM: analyse findings, generate privesc plan, execute
+- Capture root flag
+
+**6. Report**
+- LLM writes full HTB-style writeup
+- `tools/mitre_mapper.py` keyword-matches session text → ATT&CK technique table
+- Commits to ctf-lab repo, pushes to GitHub and Forgejo
+
+---
+
+## Q: How does the checkpoint system work?
+
+Every action that runs against the target goes through a checkpoint:
+
+```
+FOUND: nmap NSE detected ms17-010 on port 445
+PLAN: run EternalBlue exploit (searchsploit 42315)
+WHY: confirmed vulnerable version, SMB accessible, no auth required
+RISK: high
+Approve? (y/n/skip/modify)
 ```
 
-**What happens:**
+In `--auto` mode, actions at or below the configured risk threshold are auto-approved. Default: low and medium auto-approve, high always prompts.
 
-**Recon** finds SSH on 22 and HTTP on 80. WhatWeb identifies `Request Tracker 4.4.4` — a ticketing system. NSE vuln scripts don't find a direct CVE.
+Why checkpoints matter: LLMs make mistakes. An autonomous tool that executes a high-risk action on wrong reasoning can cause an incident — hitting an out-of-scope IP, running a destructive exploit, locking out an account. The checkpoint forces a human to verify the reasoning before execution. In a lab, `--auto` is fine. In a real engagement, every action is reviewed.
 
-**Enumeration** — no SMB. Hydra against SSH returns nothing with the default wordlist.
+---
 
-**Web** — gobuster finds `/rt`. nikto flags the RT version. ffuf finds no hidden directories. The LLM analyses the findings: "Request Tracker 4.4.4 is known to ship with default credentials `root:password`. Check login before attempting exploitation."
+## Q: Explain the tiered LLM strategy.
 
-**Exploit** — LLM plan: try default credentials on RT web interface. Shell: RT has a user profile with SSH private key in the "notes" field. Extract key, SSH as `lnorgaard`.
-
-```
-[exploit] User flag: HTB{5a4c2f3d...}
-```
-
-**PrivEsc** — `sudo -l` returns nothing. SUID check finds nothing unusual. Cron check: `/home/lnorgaard/rt-home-backup.sh` runs as root every 5 minutes. File is world-writable. LLM plan: append reverse shell to the script, wait.
-
-```
-[privesc] Root flag: HTB{9f1e7b2c...}
-```
-
-**Report** generates a writeup automatically and appends a MITRE ATT&CK table:
-
-| Technique | Name | Tactic |
+| Stage | Model | Why |
 |---|---|---|
-| T1592 | Gather Victim Host Information | Reconnaissance |
-| T1078.001 | Valid Accounts: Default Accounts | Initial Access |
-| T1005 | Data from Local System (SSH key exfil) | Collection |
-| T1053.003 | Scheduled Task/Job: Cron | Privilege Escalation |
+| Recon / Enumeration | Claude Haiku | Fast, cheap; reading nmap output is pattern matching, not reasoning |
+| Exploit / PrivEsc | Claude Sonnet | Higher stakes — wrong plan wastes time or causes damage |
+| Report | Claude Sonnet | Quality matters for the portfolio writeup |
 
-Writeup committed to `ctf-lab` repository, pushed to GitHub and Forgejo. Total time: 22 minutes.
+**Prompt caching**: system prompts (tool descriptions, stage instructions, output schemas) are cached across agents. Same content sent once, re-used for all agents in the run. Cuts ~80-90% of input token cost on a full 6-stage run.
 
----
-
-## Human-in-the-Loop Design — Why It Matters
-
-ATLAS is not fully autonomous by default. Every action that touches the target goes through a checkpoint:
-
-```
-╔══════════════════════════════════════════════════════════╗
-║  CHECKPOINT: Exploit Stage                               ║
-║  Found: RT 4.4.4 with possible default credentials      ║
-║  Plan: attempt login root:password on http://10.10.11.227║
-║  Risk: low                                               ║
-╚══════════════════════════════════════════════════════════╝
-  Approve? (y/n/skip)
-```
-
-The `--auto` flag exists for controlled lab environments. In a real engagement, the operator must approve each action — because the LLM reasoning can be wrong, and executing a high-risk action based on incorrect analysis is how you cause an incident instead of documenting one.
-
-This architecture is a deliberate response to a real failure mode in autonomous pentest tools: they can execute actions that are out of scope, destructive, or legally problematic when run without supervision. Building the checkpoint system from scratch meant understanding exactly where those failure modes are and why.
+**Ollama fallback**: `--provider ollama --model hermes3:70b` routes everything to local GPU server. Free, air-gapped, no API key.
 
 ---
 
-## LLM Strategy — Tiered Model Usage
+## Q: How does the MITRE ATT&CK mapping work?
 
-Not every stage needs the same model:
+`tools/mitre_mapper.py` scans all session text — tool outputs, LLM summaries, findings, notes — for keywords. No structured data needed.
 
-| Stage | Model | Reason |
-|---|---|---|
-| Recon / Enumeration | `claude-haiku-4-5` | Fast, cheap; parsing nmap output doesn't need deep reasoning |
-| Exploit / PrivEsc | `claude-sonnet-4-6` | Complex reasoning; wrong plans have consequences |
-| Report / Writeup | `claude-sonnet-4-6` | Quality matters; this goes in the portfolio |
-
-**Prompt caching** is enabled on all system prompts. The tool descriptions, stage instructions, and output schemas are cached across agents. On a full 6-stage run, this reduces input token cost by ~80-90% — a meaningful difference when running multiple machines per day.
-
-**Ollama fallback** (`--provider ollama --model hermes3:70b`) routes everything to a local GPU server for air-gapped runs or cost control.
-
----
-
-## MITRE ATT&CK Mapping — Automatic, Not Manual
-
-The reporter doesn't require structured input to generate the ATT&CK table. `tools/mitre_mapper.py` scans all session text — tool outputs, LLM summaries, findings, notes — for keywords that indicate specific techniques:
-
+Example:
 ```python
-(["sudo", "sudo -l", "sudoers"], AttackTechnique(
-    "T1548.003", "Sudo and Sudo Caching", "Privilege Escalation", "TA0004", ...
-)),
-(["suid", "setuid", "suid binary"], AttackTechnique(
-    "T1548.001", "Setuid and Setgid", "Privilege Escalation", "TA0004", ...
-)),
+(["sudo", "sudo -l"], AttackTechnique("T1548.003", "Sudo and Sudo Caching", ...))
+(["suid", "setuid"],  AttackTechnique("T1548.001", "Setuid and Setgid", ...))
+(["hydra", "brute"],  AttackTechnique("T1110.001", "Brute Force: Password Guessing", ...))
 ```
 
-Every writeup automatically ends with a technique table that maps the engagement to the ATT&CK framework. This is directly useful for defenders: the same table tells a blue team which detections to verify were in place.
+The mapper covers 28 techniques across 9 tactics: Reconnaissance, Initial Access, Credential Access, Lateral Movement, Discovery, Privilege Escalation, Execution, Persistence, Collection.
+
+Every writeup ends with a technique table. This is useful for defenders: the same table shows which detections should have fired and can be used to validate coverage.
 
 ---
 
-## Architecture
+## Q: What is enum4linux? What does it find?
 
-```
-atlas.py
-  │
-  ├─ preflight()              VPN check + ping
-  ├─ llm.get_provider()       tiered Claude or Ollama
-  └─ run_pipeline()
-       │
-       ├─ agents/recon.py         nmap + WhatWeb → LLM analysis
-       ├─ agents/enumeration.py   enum4linux + hydra + netexec → LLM
-       ├─ agents/web.py           nikto + gobuster + ffuf + nuclei → LLM
-       ├─ agents/exploit.py       searchsploit → LLM plan → execute
-       ├─ agents/privesc.py       SSH post-shell + LinPEAS → LLM
-       └─ agents/reporter.py      LLM writeup + MITRE ATT&CK + git push
+enum4linux is an SMB/RPC enumeration tool (wrapper around Samba utilities). It queries:
+- Domain/workgroup name
+- User list (via RPC)
+- Share names and permissions
+- Password policy (lockout threshold, complexity requirements)
+- OS information
 
-  checkpoint.py       human approval gate (bypassed in --auto for low/medium risk)
-  state.py            full session persistence to ~/.atlas/sessions/
-  tools/runner.py     subprocess wrapper with timeout + output capture
-  tools/mitre_mapper.py  keyword → ATT&CK technique mapping
-```
+Useful when SMB is open — which is common on Windows targets and legacy Linux. The output tells you usernames to target with hydra, shares to mount and browse, and domain info for AD attacks.
 
 ---
 
-## Quick Start
+## Q: What's the difference between gobuster and ffuf?
 
-```bash
-git clone https://git.greenbladesec.com/gpsingh/p5-atlas
-cd p5-atlas
-python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+**gobuster**: directory/file brute-force. Give it a wordlist, it tries every word as a URL path. Fast, simple, reliable. Good for initial discovery.
 
-# Requires HTB VPN connected
-export ANTHROPIC_API_KEY="sk-ant-..."
+**ffuf**: more flexible fuzzer. Can fuzz any part of a request — URL paths, headers, parameters, POST body. Used for:
+- Vhost enumeration: `ffuf -H "Host: FUZZ.target.htb"` — finds subdomains
+- Parameter fuzzing: `ffuf -u http://target/page?FUZZ=value` — finds hidden params
+- POST body fuzzing: form input fuzzing
 
-# Interactive mode (approve each action)
-python atlas.py 10.10.11.100
+Both use wordlists. ffuf is more powerful but requires more configuration.
 
-# Auto mode (approve low+medium automatically)
-python atlas.py 10.10.11.100 --auto
+---
 
-# Local LLM (no API key needed)
-python atlas.py 10.10.11.100 --provider ollama --model hermes3:70b
+## Q: How does SSH-based privilege escalation work in ATLAS?
 
-# Resume from a specific stage
-python atlas.py 10.10.11.100 --resume --stage privesc
+After getting a shell (SSH credentials from enumeration or exploit), the PrivEsc agent runs commands over SSH:
 
-# See all past sessions
-python atlas.py --list-sessions
-```
+1. `id` — what user am I, what groups
+2. `sudo -l` — what can this user run as root
+3. `find / -perm -4000 2>/dev/null` — SUID binaries (run as owner, usually root)
+4. `getcap -r / 2>/dev/null` — Linux capabilities (fine-grained privilege escalation)
+5. `cat /etc/crontab` + writable script check — cron jobs running as root
+6. `uname -r` — kernel version for kernel exploit candidates
+7. Optional: upload and run LinPEAS, parse its output
+
+LLM receives all this output and reasons about which finding is the best privesc path.
+
+---
+
+## Key technical facts to have ready
+
+- **Stage count**: 6 — Recon, Enumeration, Web, Exploit, PrivEsc, Report
+- **LLM models**: Haiku (recon/enum), Sonnet (exploit/privesc/report), Ollama (local fallback)
+- **Cost reduction**: prompt caching ~80-90% input token savings
+- **Checkpoint risk levels**: low / medium / high / critical
+- **Tools**: nmap, whatweb, enum4linux-ng, smbclient, hydra, netexec, nikto, gobuster, ffuf, nuclei, searchsploit, sshpass, LinPEAS
+- **Session persistence**: `~/.atlas/sessions/<ip>-<timestamp>.json` — resume from any stage
+- **ATT&CK coverage**: 28 techniques, 9 tactics
+- **Commercial equivalents**: Pentera, NodeZero, Horizon3.ai, Metasploit Pro
+
+---
+
+## Q: What would you improve or add?
+
+- **Metasploit RPC integration** — currently uses searchsploit + manual exploit execution; MSF RPC would let ATLAS select and run modules programmatically with staged payloads
+- **CVE API lookup** — cross-reference discovered service versions with NVD API for immediate severity and patch status
+- **AD-specific chain** — BloodHound ingestor + path analysis + LLM attack path selection for Active Directory environments
+- **Web app fuzzing** — ffuf parameter fuzzing depth after initial directory discovery (currently only vhost enumeration via ffuf)
+
+---
+
+## What I'd say if asked "what was the hardest part?"
+
+Getting the parallel tool execution and LLM reasoning to work together reliably. In the Web stage, nikto, gobuster, and ffuf run in parallel. Each produces different output formats. The LLM has to receive all three outputs and reason about them as a unified picture — not treat each tool's output in isolation. Getting the prompt structure right so the LLM produced useful, actionable plans rather than generic recommendations required a lot of iteration. Also the vhost ffuf issue: initially used a hardcoded filter size of 0, which produced massive false-positive results. Fixed by probing a random subdomain first to get the baseline response size, then filtering against that.
+
+---
+
+## What I learned about LLMs in offensive security
+
+**Where they help:**
+- Filtering searchsploit results (20 candidates → 2 worth trying)
+- Reasoning about what privesc finding to prioritise when you have 5 options
+- Writing the post-engagement writeup in consistent, clear format
+
+**Where they fail:**
+- Generating exploit code that actually works — too many environment-specific variables
+- Reasoning about timing-based attacks
+- Understanding binary exploitation (ROP chains, heap grooming) — needs structured symbolic analysis, not text generation
+
+The pattern: LLMs are good at *ranking and explaining* findings, bad at *generating working exploit code*. Use them as an analyst's assistant, not as an exploit developer.

@@ -70,14 +70,30 @@ class EnumerationAgent(BaseAgent):
         if ldap_ports:
             cr = self.checkpoint(
                 what_found=f"LDAP on port(s): {', '.join(str(p.number) for p in ldap_ports)}",
-                plan="ldapsearch anonymous base query",
-                why="Anonymous LDAP often leaks usernames, groups, descriptions with passwords, and AD structure.",
-                what_to_look_for="User accounts, description fields with passwords, service accounts, domain name",
+                plan="ldapsearch: base query → full user enumeration (anonymous)",
+                why="Anonymous LDAP leaks usernames, groups, description fields (often contain passwords), and full AD structure.",
+                what_to_look_for="User accounts, description fields with passwords, service accounts, domain naming context",
                 command=f"ldapsearch -x -H ldap://{ip} -b '' -s base namingContexts",
                 risk="low",
             )
             if cr.approved:
-                approved_tasks.append({"name": "ldap_base", "command": f"ldapsearch -x -H ldap://{ip} -b '' -s base namingContexts", "timeout": 30, "log_dir": self.output_dir})
+                # Base query first to get naming context
+                approved_tasks.append({
+                    "name": "ldap_base",
+                    "command": f"ldapsearch -x -H ldap://{ip} -b '' -s base namingContexts",
+                    "timeout": 30, "log_dir": self.output_dir,
+                })
+                # Full user enum — try without base DN first (works on many HTB AD boxes)
+                approved_tasks.append({
+                    "name": "ldap_users",
+                    "command": (
+                        f"ldapsearch -x -H ldap://{ip} -b 'DC=htb,DC=local' "
+                        f"'(objectClass=user)' sAMAccountName description mail 2>/dev/null || "
+                        f"ldapsearch -x -H ldap://{ip} -b '' '(objectClass=user)' "
+                        f"sAMAccountName description 2>/dev/null"
+                    ),
+                    "timeout": 60, "log_dir": self.output_dir,
+                })
 
         # ── SNMP ─────────────────────────────────────────────────
         snmp_ports = [p for p in self.session.open_ports if "snmp" in p.service.lower() or p.number == 161]
@@ -115,6 +131,9 @@ class EnumerationAgent(BaseAgent):
             if "ldap_base" in parallel_results:
                 result.raw_outputs["ldap_base"] = parallel_results["ldap_base"].output
                 findings.append(f"LDAP base:\n{parallel_results['ldap_base'].output[:300]}")
+            if "ldap_users" in parallel_results and parallel_results["ldap_users"].output:
+                result.raw_outputs["ldap_users"] = parallel_results["ldap_users"].output
+                findings.append(f"LDAP users:\n{parallel_results['ldap_users'].output[:1500]}")
             if "snmp" in parallel_results:
                 result.raw_outputs["snmp"] = parallel_results["snmp"].output
                 findings.append(f"SNMP:\n{parallel_results['snmp'].output[:500]}")

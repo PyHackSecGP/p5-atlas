@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+import re
 
 
 class Stage(str, Enum):
@@ -74,6 +75,18 @@ class AgentResult:
 
 
 @dataclass
+class MachineAttackPlan:
+    """Planner agent output — drives dynamic stage routing."""
+    stage_order: list[str] = field(default_factory=list)
+    skip_stages: list[str] = field(default_factory=list)
+    stage_tactics: dict[str, list[str]] = field(default_factory=dict)
+    primary_vector: str = ""
+    machine_difficulty: str = "medium"
+    machine_type: str = ""
+    reasoning: str = ""
+
+
+@dataclass
 class HackSession:
     target_ip: str
     machine_name: str = ""
@@ -90,7 +103,8 @@ class HackSession:
     root_flag: str = ""
     notes: list[str] = field(default_factory=list)
 
-    loot: list[str] = field(default_factory=list)   # paths to downloaded loot files
+    loot: list[str] = field(default_factory=list)           # paths to downloaded loot files
+    attack_plan: MachineAttackPlan | None = None            # set by PlannerAgent
 
     @property
     def open_ports(self) -> list[Port]:
@@ -126,17 +140,59 @@ class HackSession:
         return None
 
     def context_summary(self) -> str:
-        """Compact state summary fed to every LLM call."""
+        """Rich state summary fed to every LLM call."""
         lines = [
             f"Target: {self.target_ip}  OS: {self.os_guess or 'unknown'}",
             f"Stage: {self.current_stage.value}",
             f"Open ports: {', '.join(str(p.number)+'/'+p.service for p in self.open_ports) or 'none yet'}",
             f"Web targets: {', '.join(w.url for w in self.web_targets) or 'none'}",
-            f"Credentials: {len(self.credentials)}",
-            f"Findings: {len(self.findings)}",
-            f"User flag: {'CAPTURED' if self.user_flag else 'not yet'}",
-            f"Root flag: {'CAPTURED' if self.root_flag else 'not yet'}",
         ]
+
+        # Credentials — usernames only (never expose passwords in LLM context)
+        if self.credentials:
+            lines.append(f"Credentials: {len(self.credentials)}")
+            users = list(dict.fromkeys(c.username for c in self.credentials if c.username))
+            if users:
+                lines.append(f"  Known users: {', '.join(users[:8])}")
+            services = list(dict.fromkeys(
+                f"{c.username}@{c.service}" for c in self.credentials
+                if c.username and c.password and c.service
+            ))
+            if services:
+                lines.append(f"  Cracked: {', '.join(services[:5])}")
+        else:
+            lines.append("Credentials: none")
+
+        # Top findings
+        lines.append(f"Findings: {len(self.findings)}")
+        for f in self.findings[:4]:
+            lines.append(f"  [{f.severity.value.upper()}] {f.title}")
+
+        # Loot
+        if self.loot:
+            lines.append(f"Loot: {len(self.loot)} file(s) downloaded")
+
+        # Flags
+        lines.append(f"User flag: {'CAPTURED — ' + self.user_flag if self.user_flag else 'not yet'}")
+        lines.append(f"Root flag: {'CAPTURED — ' + self.root_flag if self.root_flag else 'not yet'}")
+
+        # Attack plan summary
+        if self.attack_plan:
+            plan = self.attack_plan
+            lines.append(f"Attack plan: {plan.machine_type} [{plan.machine_difficulty}]")
+            lines.append(f"  Primary vector: {plan.primary_vector}")
+            if plan.skip_stages:
+                lines.append(f"  Skipping: {', '.join(plan.skip_stages)}")
+
         if self.notes:
             lines.append("Notes: " + " | ".join(self.notes[-3:]))
+
         return "\n".join(lines)
+
+    def extract_flag(self, output: str) -> str:
+        """Extract HTB flag from tool output."""
+        m = re.search(r'HTB\{[^}]+\}', output)
+        if m:
+            return m.group(0)
+        m = re.search(r'\b[0-9a-f]{32}\b', output, re.I)
+        return m.group(0) if m else ""

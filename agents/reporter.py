@@ -2,12 +2,14 @@
 from __future__ import annotations
 import datetime
 import subprocess
+import time
 from pathlib import Path
 from models import HackSession, AgentResult, Stage
 from llm import LLMProvider
 from agents.base import BaseAgent
 from tools.mitre_mapper import map_findings_to_attack, format_attack_table_markdown
 import checkpoint as cp
+import metrics
 
 
 class ReporterAgent(BaseAgent):
@@ -146,6 +148,14 @@ For each step explain WHY you did it, WHAT you expected, and WHAT you found.""",
                     self._push_to_remotes(ctf_path)
                 else:
                     self.log(f"Commit failed: {commit_result.stderr[:200]}", "error")
+
+        try:
+            start = getattr(session, "started_at", None)
+            dur = (time.time() - start) if start else None
+            metrics.record_run(session, duration_sec=dur)
+            self.log("Portfolio metric recorded", "info")
+        except Exception as exc:
+            self.log(f"Metric record failed: {exc}", "warn")
 
         result.summary = f"Writeup generated at {writeup_path}"
         return result

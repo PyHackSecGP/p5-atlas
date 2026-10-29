@@ -129,6 +129,43 @@ python atlas.py --list-sessions
 
 ---
 
+## Portfolio Metrics
+
+Every completed run appends a record to `~/.atlas/portfolio.json`
+(target, flag captures, duration, MITRE techniques, agents used).
+
+Print aggregate stats:
+
+```bash
+python -m metrics
+```
+
+Sample output:
+
+```
+ATLAS Portfolio
+===============
+Total runs:        12
+User flags:        10  (83.3%)
+Root flags:        7   (58.3%)
+Both flags:        7   (solve rate 58.3%)
+Avg duration:      2103.4s
+
+By difficulty:
+  easy       4/4   (100% rooted)
+  medium     3/6   (50% rooted)
+  hard       0/2   (0% rooted)
+
+Top MITRE techniques:
+  T1190      8
+  T1548      5
+  T1136      3
+```
+
+Override location with `ATLAS_PORTFOLIO=/path/to/portfolio.json`.
+
+---
+
 ## Stack
 
 Python 3.11 · Anthropic Claude (tiered Haiku/Sonnet) · Ollama · nmap · gobuster · nikto · ffuf · hydra · searchsploit · sshpass · rich
